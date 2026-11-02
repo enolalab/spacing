@@ -1586,13 +1586,13 @@ fn rel(code: u16, value: i32) -> Option<Ev> {
 }
 ```
 
-`crates/spacing-capture/src/lib.rs` — thiết kế: giữ `Vec<EventStream>` (EventStream own Device; grab qua `get_mut()`). KHÔNG dùng `into_stream(self)` — consume owner thì `grab()` không gọi được nữa:
+`crates/spacing-capture/src/lib.rs` — thiết kế: giữ `Vec<EventStream>` (EventStream own Device; grab qua `device_mut()` — evdev 0.12.2 không có `get_mut()`). KHÔNG dùng `into_stream(self)` — consume owner thì `grab()` không gọi được nữa. `select_all` dùng `iter_mut()` trực tiếp (async-block `filter_map` tạo `!Unpin` → SelectAll bị stuck ở `Unpin` bound):
 
 ```rust
 pub mod map;
 
 use futures::stream;
-use futures::StreamExt;
+use futures::StreamExt as _;
 use spacing_core::event::InputEvent;
 use std::io;
 
@@ -1643,7 +1643,7 @@ impl EvdevCapture {
     /// device is left hidden from the OS (golden rule).
     pub fn grab(&mut self) -> io::Result<()> {
         for s in &mut self.streams {
-            if let Err(e) = s.get_mut().grab() {
+            if let Err(e) = s.device_mut().grab() {
                 let _ = self.ungrab();
                 return Err(e);
             }
@@ -1653,24 +1653,22 @@ impl EvdevCapture {
 
     pub fn ungrab(&mut self) -> io::Result<()> {
         for s in &mut self.streams {
-            let _ = s.get_mut().ungrab(); // best-effort: never leave grabbed
+            let _ = s.device_mut().ungrab(); // best-effort: never leave grabbed
         }
         Ok(())
     }
 
     /// Next mapped input event; skips unmapped. The `&mut self` borrow ends
     /// when the future resolves, so the server can grab()/ungrab() inside
-    /// the same select! loop. (`&mut EventStream: Stream` requires
-    /// EventStream: Unpin — true for evdev 0.12.)
+    /// the same select! loop.
     pub async fn next_event(&mut self) -> Option<InputEvent> {
-        let mut merged = stream::select_all(
-            self.streams
-                .iter_mut()
-                .map(|s| s.filter_map(|r| async move { r.ok() })),
-        );
+        // `&mut EventStream: Stream` (EventStream: Unpin in evdev 0.12).
+        let mut merged = stream::select_all(self.streams.iter_mut());
         while let Some(raw) = merged.next().await {
-            if let Some(ev) = map::map_event(raw) {
-                return Some(ev);
+            if let Ok(ev) = raw {
+                if let Some(ev) = map::map_event(ev) {
+                    return Some(ev);
+                }
             }
         }
         None
@@ -2534,5 +2532,5 @@ git commit -m "docs: README quickstart + udev rules + E2E checklist"
 - Keystrokes MUST NOT be logged anywhere (Global Constraints).
 - If `evdev::uinput` API drifts (crate version), adapt — contract is the
   `to_evdev`/`map_event` map tests, which are version-independent. Tương tự
-  với `EventStream::get_mut` (0.12.x cũ có thể gọi là `device_mut`).
+  với `EventStream::device_mut` (0.12.2 verified — `get_mut` không tồn tại).
 - All tasks assume repo root `/home/k0walski/Code/spacing`, git initialized.

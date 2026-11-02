@@ -5,3 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+spacing-core = { path = "../spacing-core" }
+evdev = { version = "0.12", features = ["tokio"] }
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
