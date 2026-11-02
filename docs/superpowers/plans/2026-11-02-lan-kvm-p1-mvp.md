@@ -12,7 +12,7 @@ Spec nguồn: `docs/superpowers/specs/2026-11-02-lan-kvm-design.md`
 
 ## Global Constraints
 
-- Edition `2021`, `cargo test` phải pass ở mọi task; `cargo clippy` không warning mới.
+- Edition `2021`, `cargo test --workspace` phải pass ở mọi task (`default-members=["."]` nên `cargo test` trần chỉ chạy test của bin `spacing` — luôn dùng `--workspace` hoặc `-p <crate>`); `cargo clippy` không warning mới.
 - Wire: TCP + TLS1.3, frame = `u32 len` (LE) + `postcard` payload, max frame 2 MiB.
 - Canonical key trên wire = **USB HID usage ID** (keyboard page 0x07), `u16`.
 - Heartbeat 250ms khi remote active; client watchdog 500ms → `release_all()`.
@@ -32,7 +32,12 @@ Spec nguồn: `docs/superpowers/specs/2026-11-02-lan-kvm-design.md`
 - Create: `crates/spacing-core/src/event.rs`
 - Create: `crates/spacing-core/src/protocol.rs`
 - Create: `crates/spacing-core/src/hidmap.rs`
+- Create: `crates/spacing-net/Cargo.toml` + `crates/spacing-net/src/lib.rs` (skeleton rỗng — impl ở Task 4)
+- Create: `crates/spacing-capture/Cargo.toml` + `crates/spacing-capture/src/lib.rs` (skeleton — Task 5)
+- Create: `crates/spacing-inject/Cargo.toml` + `crates/spacing-inject/src/lib.rs` (skeleton — Task 6)
 - Test: `crates/spacing-core/src/lib.rs` (module tests inline)
+
+> Skeleton crates là BẮT BUỘC: root `[dependencies]` trỏ path tới cả 4 crate — thiếu manifest nào workspace không parse, `cargo test -p spacing-core` cũng fail.
 
 **Interfaces:**
 - Produces (cả plan dùng): `spacing_core::event::{InputEvent, MouseButton}`; `spacing_core::protocol::{Message, PROTOCOL_VERSION, CLIPBOARD_MAX}`; `spacing_core::hidmap::{evdev_to_hid, hid_to_evdev, KEY_NAMES, key_name_to_hid}`.
@@ -104,6 +109,20 @@ postcard = { version = "1", features = ["alloc"] }
 proptest = "1"
 ```
 
+Skeleton manifests (giống nhau cho `spacing-net`, `spacing-capture`, `spacing-inject` — đổi `name`; `[dependencies]` để trống, điền ở task tương ứng):
+
+```toml
+[package]
+name = "spacing-net"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+```
+
+Mỗi `src/lib.rs` skeleton chỉ chứa một dòng comment `// filled in Task N` để file parse.
+
 Test đầu tiên — `crates/spacing-core/src/hidmap.rs` phần test (tạo file với chỉ test, compile fail vì thiếu impl):
 
 ```rust
@@ -173,7 +192,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const CLIPBOARD_MAX: usize = 1 << 20; // 1 MiB
 pub const MAX_FRAME: usize = 2 << 20;     // 2 MiB hard cap per frame
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     Hello { version: u16, hostname: String },
     HelloAck { version: u16 },
@@ -255,6 +274,65 @@ pub const KEY_NAMES: &[(&str, u16)] = &[
 pub fn key_name_to_hid(name: &str) -> Option<u16> {
     let n = name.to_ascii_lowercase();
     KEY_NAMES.iter().find(|(k, _)| *k == n).map(|(_, h)| *h)
+}
+```
+
+`protocol.rs` — thêm proptest roundtrip ở cuối file (spec §7 yêu cầu):
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::{InputEvent, MouseButton};
+    use proptest::prelude::*;
+
+    fn arb_event() -> impl Strategy<Value = InputEvent> {
+        prop_oneof![
+            any::<u16>().prop_map(InputEvent::KeyDown),
+            any::<u16>().prop_map(InputEvent::KeyUp),
+            (any::<i32>(), any::<i32>())
+                .prop_map(|(dx, dy)| InputEvent::MouseMoveRel { dx, dy }),
+            prop_oneof![
+                Just(MouseButton::Left), Just(MouseButton::Right),
+                Just(MouseButton::Middle), Just(MouseButton::Side),
+                Just(MouseButton::Extra),
+            ]
+            .prop_flat_map(|b| {
+                prop_oneof![
+                    Just(InputEvent::ButtonDown(b)),
+                    Just(InputEvent::ButtonUp(b)),
+                ]
+            }),
+            (any::<i32>(), any::<i32>())
+                .prop_map(|(dx, dy)| InputEvent::Wheel { dx, dy }),
+        ]
+    }
+
+    fn arb_message() -> impl Strategy<Value = Message> {
+        prop_oneof![
+            (any::<u16>(), "\\PC{0,64}")
+                .prop_map(|(v, h)| Message::Hello { version: v, hostname: h }),
+            any::<u16>().prop_map(|v| Message::HelloAck { version: v }),
+            "\\PC{0,64}".prop_map(|h| Message::PairRequest { hostname: h }),
+            Just(Message::PairAccept),
+            Just(Message::PairReject),
+            arb_event().prop_map(Message::Input),
+            Just(Message::ReleaseControl),
+            Just(Message::Heartbeat),
+            "\\PC{0,1024}".prop_map(|t| Message::ClipboardSet { text: t }),
+            (any::<u16>(), "\\PC{0,256}")
+                .prop_map(|(c, m)| Message::Error { code: c, message: m }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn postcard_roundtrip(msg in arb_message()) {
+            let bytes = postcard::to_allocvec(&msg).unwrap();
+            let back: Message = postcard::from_bytes(&bytes).unwrap();
+            prop_assert_eq!(back, msg);
+        }
+    }
 }
 ```
 
@@ -823,6 +901,16 @@ impl PeerStore {
     pub fn insert(&mut self, name: String, fingerprint: String) {
         self.peers.insert(name, PeerInfo { fingerprint, last_seen: None });
     }
+
+    /// Refresh `last_seen` (unix seconds — tránh thêm datetime dep).
+    pub fn seen(&mut self, name: &str) {
+        if let Some(p) = self.peers.get_mut(name) {
+            p.last_seen = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .ok();
+        }
+    }
 }
 ```
 
@@ -857,7 +945,7 @@ git commit -m "feat(core): config + peer store"
 - Produces:
   - `cert::{ensure_identity(dir) -> Result<Identity>, fingerprint_of(der) -> String}`; `Identity{certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>, fingerprint: String}`
   - `conn::{send_msg(&mut WriteHalf, &Message) -> io::Result<()>, recv_msg(&mut ReadHalf) -> io::Result<Message>}`
-  - `accept_server(tcp, id, peers, pairing_open, peers_path) -> Result<ServerConn>` (accepting a pair persists `peers.toml`); `connect_client(tcp, server_name, id, verify: impl Fn(&str)->bool) -> Result<ClientConn>` (type `Rd`/`Wr` = split halves of `TlsStream<TcpStream>`)
+  - `accept_server(tcp, id, peers: Arc<RwLock<PeerStore>>, pairing_open, peers_path) -> Result<ServerConn>` — peer store được CHIA SẺ với server loop (accept a pair: insert + persist `peers.toml`, client connect lại được ngay không cần restart); `connect_client(tcp, server_name, id, verify: impl Fn(&str)->bool) -> Result<ClientConn>` (type `Rd`/`Wr` = split halves của `TlsStream<TcpStream>`)
   - `verify::PairingVerifier`, `verify::AcceptAnyServerCert`
 
 - [ ] **Step 1: Test thất bại**
@@ -885,7 +973,7 @@ async fn paired_handshake_and_echo() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let srv_peers = server_peers.clone();
+    let srv_peers = std::sync::Arc::new(std::sync::RwLock::new(server_peers.clone()));
     let pairing_open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let peers_path = dir.path().join("peers.toml");
 
@@ -911,6 +999,52 @@ async fn paired_handshake_and_echo() {
     let m = conn::recv_msg(&mut conn.rd_half).await.unwrap();
     // first frame back is HelloAck; read again for Heartbeat
     assert!(matches!(m, Message::HelloAck { .. }) || matches!(m, Message::Heartbeat));
+}
+
+/// Pairing window: unknown client cert accepted at TLS, PairRequest →
+/// PairAccept, fingerprint persisted to peers.toml, window consumed.
+#[tokio::test]
+async fn pairing_window_registers_client_once() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server_id = cert::ensure_identity(&dir.path().join("srv")).unwrap();
+    let client_id = cert::ensure_identity(&dir.path().join("cli")).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peers = std::sync::Arc::new(std::sync::RwLock::new(PeerStore::default()));
+    let pairing_open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let peers_path = dir.path().join("peers.toml");
+
+    let (srv_peers, po) = (peers.clone(), pairing_open.clone());
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        accept_server(tcp, server_id, srv_peers, po, peers_path).await.unwrap()
+    });
+
+    let mut conn = connect_client(
+        tcp_connect(addr).await, "localhost", client_id.clone(), |_| true,
+    )
+    .await
+    .unwrap();
+    conn::send_msg(
+        &mut conn.wr_half,
+        &Message::PairRequest { hostname: "cli".into() },
+    )
+    .await
+    .unwrap();
+    match conn::recv_msg(&mut conn.rd_half).await.unwrap() {
+        Message::PairAccept => {}
+        other => panic!("expected PairAccept, got {other:?}"),
+    }
+    server.await.unwrap();
+
+    // in-memory store updated (shared Arc), persisted to disk, window closed
+    assert!(peers.read().unwrap().allow(&client_id.fingerprint));
+    assert!(!pairing_open.load(Ordering::Relaxed));
+    let reloaded = PeerStore::load(&dir.path().join("peers.toml")).unwrap();
+    assert!(reloaded.allow(&client_id.fingerprint));
 }
 ```
 
@@ -959,7 +1093,7 @@ use anyhow::{anyhow, Context};
 use spacing_core::peers::PeerStore;
 use spacing_core::protocol::{Message, PROTOCOL_VERSION};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio_rustls::rustls::{ClientConfig, ServerConfig};
@@ -1001,19 +1135,20 @@ fn peer_fp(stream: &TlsStream<TcpStream>) -> anyhow::Result<String> {
 }
 
 /// Server side: accept TCP, run mutual-TLS, verify peer fingerprint.
+/// `peers` is SHARED with the server loop — a successful pair must be
+/// visible to subsequent accepts without a restart.
 /// `pairing_open`: one-shot — unknown fingerprints are accepted at TLS
 /// layer; caller must treat next message as PairRequest.
 pub async fn accept_server(
     tcp: TcpStream,
     id: cert::Identity,
-    peers: PeerStore,
+    peers: Arc<RwLock<PeerStore>>,
     pairing_open: Arc<AtomicBool>,
     peers_path: std::path::PathBuf,
 ) -> anyhow::Result<ServerConn> {
     ensure_provider();
-    let peers_rc = std::sync::Arc::new(std::sync::RwLock::new(peers));
     let verifier = Arc::new(verify::PairingVerifier {
-        peers: peers_rc.clone(),
+        peers: peers.clone(),
         pairing_open: pairing_open.clone(),
     });
     let cfg = ServerConfig::builder()
@@ -1022,7 +1157,7 @@ pub async fn accept_server(
         .context("server tls config")?;
     let stream = TlsAcceptor::from(Arc::new(cfg)).accept(tcp).await?;
     let peer_fp = peer_fp(&stream)?;
-    let paired = peers_rc.read().unwrap().allow(&peer_fp);
+    let paired = peers.read().unwrap().allow(&peer_fp);
     if !paired && !pairing_open.load(Ordering::Relaxed) {
         anyhow::bail!("untrusted fingerprint {peer_fp}");
     }
@@ -1033,6 +1168,7 @@ pub async fn accept_server(
         Message::Hello { version, hostname } => {
             anyhow::ensure!(version == PROTOCOL_VERSION, "version mismatch {version}");
             anyhow::ensure!(paired, "hello from unpaired client");
+            peers.write().unwrap().seen(&hostname);
             conn::send_msg(&mut wr, &Message::HelloAck { version: PROTOCOL_VERSION }).await?;
             hostname
         }
@@ -1045,7 +1181,7 @@ pub async fn accept_server(
                 };
             if accepted {
                 {
-                    let mut g = peers_rc.write().unwrap();
+                    let mut g = peers.write().unwrap();
                     g.insert(hostname.clone(), peer_fp.clone());
                     g.save(&peers_path)?; // persist so future connects verify
                 }
@@ -1099,11 +1235,22 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-#[derive(Clone)]
+/// `PrivateKeyDer` does NOT implement `Clone` (only `clone_key()`),
+/// so a manual impl is required — `#[derive(Clone)]` will not compile.
 pub struct Identity {
     pub certs: Vec<CertificateDer<'static>>,
     pub key: PrivateKeyDer<'static>,
     pub fingerprint: String,
+}
+
+impl Clone for Identity {
+    fn clone(&self) -> Self {
+        Self {
+            certs: self.certs.clone(),
+            key: self.key.clone_key(),
+            fingerprint: self.fingerprint.clone(),
+        }
+    }
 }
 
 /// Load or generate a self-signed identity at `<dir>/{cert,key}.pem`.
@@ -1154,7 +1301,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use tokio_rustls::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTimestamp};
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio_rustls::rustls::{DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
 
 fn schemes() -> Vec<SignatureScheme> {
@@ -1174,9 +1321,13 @@ pub struct AcceptAnyServerCert;
 impl ServerCertVerifier for AcceptAnyServerCert {
     fn verify_server_cert(
         &self, _end: &CertificateDer<'_>, _inter: &[CertificateDer<'_>],
-        _name: &ServerName<'_>, _ocsp: &[u8], _now: UnixTimestamp,
+        _name: &ServerName<'_>, _ocsp: &[u8], _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
         Ok(ServerCertVerified::assertion())
+    }
+    // required on ServerCertVerifier since rustls 0.23.15
+    fn requires_raw_public_keys(&self) -> bool {
+        false
     }
     fn verify_tls12_signature(&self, _m: &[u8], _c: &CertificateDer<'_>, _d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> {
         Ok(HandshakeSignatureValid::assertion())
@@ -1209,7 +1360,7 @@ impl ClientCertVerifier for PairingVerifier {
     }
     fn verify_client_cert(
         &self, end: &CertificateDer<'_>, _inter: &[CertificateDer<'_>],
-        _now: UnixTimestamp,
+        _now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
         let fp = crate::cert::fingerprint_of(end);
         let trusted = self.peers.read().unwrap().allow(&fp);
@@ -1286,7 +1437,7 @@ git commit -m "feat(net): mutual-TLS transport with fingerprint pairing + framed
 
 **Interfaces:**
 - Consumes: `spacing_core::{event::*, hidmap::evdev_to_hid}`.
-- Produces: `EvdevCapture::enumerate() -> io::Result<Self>`; `grab()`,`ungrab()`; `into_stream(self) -> impl Stream<Item = InputEvent>`; pure `map::map_event(evdev::InputEvent) -> Option<InputEvent>`.
+- Produces: `EvdevCapture::enumerate() -> io::Result<Self>`; `grab()`,`ungrab()` (grab fail → ungrab tất cả, không bao giờ để device kẹt grab); `next_event(&mut self) -> Option<InputEvent>` (borrow `&mut self` chỉ trong lúc await — BẮT BUỘC để `grab()` gọi được trong `select!`; `into_stream(self)` consume owner → không dùng được); pure `map::map_event(evdev::InputEvent) -> Option<InputEvent>`.
 
 - [ ] **Step 1: Test thất bại**
 
@@ -1428,79 +1579,94 @@ fn rel(code: u16, value: i32) -> Option<Ev> {
 }
 ```
 
-`crates/spacing-capture/src/lib.rs`:
+`crates/spacing-capture/src/lib.rs` — thiết kế: giữ `Vec<EventStream>` (EventStream own Device; grab qua `get_mut()`). KHÔNG dùng `into_stream(self)` — consume owner thì `grab()` không gọi được nữa:
 
 ```rust
 pub mod map;
 
-use evdev::{Device, EventType};
-use futures::stream::{self, SelectAll};
+use futures::stream;
 use futures::StreamExt;
 use spacing_core::event::InputEvent;
 use std::io;
 
-/// Owns all grabbed physical input devices (keyboards + pointers).
+/// Owns all physical input devices as event streams.
+/// grab() = EVIOCGRAB trên từng fd (OS ngừng nhận input); stream vẫn đọc được.
 pub struct EvdevCapture {
-    devices: Vec<Device>,
+    streams: Vec<evdev::EventStream>,
 }
 
 impl EvdevCapture {
-    /// Scan /dev/input and keep devices that look like keyboards or mice.
-    /// Requires read access to /dev/input/event* (input group or root).
+    /// Scan /dev/input, keep devices that look like keyboards or mice,
+    /// convert each to an EventStream. Requires read access to
+    /// /dev/input/event* (input group or root).
     pub fn enumerate() -> io::Result<Self> {
-        let mut devices = Vec::new();
+        let mut streams = Vec::new();
         for (path, device) in evdev::enumerate() {
             let is_kb = device
                 .supported_keys()
                 .map(|k| {
-                    (30..=38).all(|c| k.contains(evdev::Key::new(c))) // A..L
+                    (30..=38u16).all(|c| k.contains(evdev::Key::new(c))) // A..L
                 })
                 .unwrap_or(false);
             let is_mouse = device.supported_relative_axes().map(|r| {
                 r.contains(evdev::RelativeAxisType::REL_X)
                     && r.contains(evdev::RelativeAxisType::REL_Y)
             });
-            if is_kb || is_mouse.unwrap_or(false) {
-                tracing::info!(?path, name = device.name(), "capturing device");
-                devices.push(device);
+            if !(is_kb || is_mouse.unwrap_or(false)) {
+                continue;
+            }
+            match device.into_event_stream() {
+                Ok(s) => {
+                    tracing::info!(?path, "capturing device");
+                    streams.push(s);
+                }
+                Err(e) => tracing::warn!(?path, "event stream failed: {e}"),
             }
         }
-        if devices.is_empty() {
+        if streams.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no keyboard/mouse found in /dev/input — check input group permissions",
             ));
         }
-        Ok(Self { devices })
+        Ok(Self { streams })
     }
 
-    /// Exclusive-grab every device: OS stops receiving input.
+    /// Exclusive-grab every device. On failure, releases all grabs so no
+    /// device is left hidden from the OS (golden rule).
     pub fn grab(&mut self) -> io::Result<()> {
-        for d in &mut self.devices {
-            d.grab()?;
+        for s in &mut self.streams {
+            if let Err(e) = s.get_mut().grab() {
+                let _ = self.ungrab();
+                return Err(e);
+            }
         }
         Ok(())
     }
 
     pub fn ungrab(&mut self) -> io::Result<()> {
-        for d in &mut self.devices {
-            let _ = d.ungrab(); // best-effort: never leave grabbed on error path
+        for s in &mut self.streams {
+            let _ = s.get_mut().ungrab(); // best-effort: never leave grabbed
         }
         Ok(())
     }
 
-    /// Merge all device streams; always emits (grab only gates OS delivery).
-    pub fn into_stream(
-        self,
-    ) -> impl futures::Stream<Item = InputEvent> + Send {
-        let streams = self
-            .devices
-            .into_iter()
-            .filter_map(|d| d.into_event_stream().ok())
-            .map(|s| s.filter_map(|r| async move { r.ok() }))
-            .map(|s| s.filter_map(|ev| async move { map::map_event(ev) }));
-        let merged: SelectAll<_> = stream::select_all(streams);
-        merged
+    /// Next mapped input event; skips unmapped. The `&mut self` borrow ends
+    /// when the future resolves, so the server can grab()/ungrab() inside
+    /// the same select! loop. (`&mut EventStream: Stream` requires
+    /// EventStream: Unpin — true for evdev 0.12.)
+    pub async fn next_event(&mut self) -> Option<InputEvent> {
+        let mut merged = stream::select_all(
+            self.streams
+                .iter_mut()
+                .map(|s| s.filter_map(|r| async move { r.ok() })),
+        );
+        while let Some(raw) = merged.next().await {
+            if let Some(ev) = map::map_event(raw) {
+                return Some(ev);
+            }
+        }
+        None
     }
 }
 ```
@@ -1559,9 +1725,11 @@ mod tests {
     }
 
     #[test]
-    fn wheel_scales_to_hires() {
+    fn wheel_emits_detents_and_hires() {
+        // like real mice: lo-res detent (±1) + hi-res 1/120 unit
         let out = to_evdev(&Ev::Wheel { dx: 0, dy: 1 });
-        assert!(codes(&out).contains(&(evdev::EventType::RELATIVE.0, 0x08, 120)));
+        assert!(codes(&out).contains(&(evdev::EventType::RELATIVE.0, 0x08, 1)));   // REL_WHEEL
+        assert!(codes(&out).contains(&(evdev::EventType::RELATIVE.0, 0x0B, 120))); // REL_WHEEL_HI_RES
     }
 
     #[test]
@@ -1601,7 +1769,9 @@ use spacing_core::hidmap::hid_to_evdev;
 
 const SYN: (u16, u16, i32) = (0, 0, 0); // EV_SYN / SYN_REPORT
 
-fn btn_code(b: MouseButton) -> u16 {
+/// BTN_* evdev code for a wire button (pub(crate) — injector tracks held
+/// buttons via these codes for release_all).
+pub(crate) fn btn_code(b: MouseButton) -> u16 {
     match b {
         MouseButton::Left => 0x110,
         MouseButton::Right => 0x111,
@@ -1640,12 +1810,16 @@ pub fn to_evdev(wire: &Ev) -> Vec<evdev::InputEvent> {
             }
         }
         Ev::Wheel { dx, dy } => {
-            // wire detents -> hi-res 1/120 units
+            // lo-res detents + hi-res 1/120 units (like real mice).
+            // REL_WHEEL=0x08, REL_HWHEEL=0x06, REL_WHEEL_HI_RES=0x0B, REL_HWHEEL_HI_RES=0x0C.
+            // (0x08 with value*120 = scroll 120 detents — wrong!)
             if dy != 0 {
-                push(evdev::EventType::RELATIVE, 0x08, dy * 120);
+                push(evdev::EventType::RELATIVE, 0x08, dy);
+                push(evdev::EventType::RELATIVE, 0x0B, dy * 120);
             }
             if dx != 0 {
-                push(evdev::EventType::RELATIVE, 0x06, dx * 120);
+                push(evdev::EventType::RELATIVE, 0x06, dx);
+                push(evdev::EventType::RELATIVE, 0x0C, dx * 120);
             }
         }
     }
@@ -1664,7 +1838,7 @@ pub mod map;
 use evdev::uinput::VirtualDeviceBuilder;
 use evdev::{AttributeSet, Key, RelativeAxisType};
 use spacing_core::event::InputEvent;
-use spacing_core::hidmap::EV_TO_HID;
+use spacing_core::hidmap::{hid_to_evdev, EV_TO_HID};
 use std::collections::HashSet;
 use std::io;
 
@@ -1673,7 +1847,7 @@ use std::io;
 /// /dev/uinput (see README udev rule).
 pub struct UinputInject {
     dev: evdev::uinput::VirtualDevice,
-    held_keys: HashSet<u16>, // evdev codes currently down
+    held: HashSet<u16>, // evdev codes currently down (keys AND BTN_* buttons)
 }
 
 impl UinputInject {
@@ -1698,33 +1872,40 @@ impl UinputInject {
             .with_keys(&keys)?
             .with_relative_axes(&axes)?
             .build()?;
-        Ok(Self { dev, held_keys: HashSet::new() })
+        Ok(Self { dev, held: HashSet::new() })
     }
 
     pub fn inject(&mut self, ev: &InputEvent) -> io::Result<()> {
-        for raw in map::to_evdev(ev) {
-            self.dev.emit(&[raw])?;
+        let out = map::to_evdev(ev);
+        if !out.is_empty() {
+            self.dev.emit(&out)?; // one write() per wire event
         }
-        // track held keys for release_all
+        // track held codes (keys + buttons) for release_all
         match *ev {
             InputEvent::KeyDown(hid) => {
-                if let Some(c) = spacing_core::hidmap::hid_to_evdev(hid) {
-                    self.held_keys.insert(c);
+                if let Some(c) = hid_to_evdev(hid) {
+                    self.held.insert(c);
                 }
             }
             InputEvent::KeyUp(hid) => {
-                if let Some(c) = spacing_core::hidmap::hid_to_evdev(hid) {
-                    self.held_keys.remove(&c);
+                if let Some(c) = hid_to_evdev(hid) {
+                    self.held.remove(&c);
                 }
+            }
+            InputEvent::ButtonDown(b) => {
+                self.held.insert(map::btn_code(b));
+            }
+            InputEvent::ButtonUp(b) => {
+                self.held.remove(&map::btn_code(b));
             }
             _ => {}
         }
         Ok(())
     }
 
-    /// Key-up every tracked key — invoked on disconnect/watchdog.
+    /// Key-up every tracked code — invoked on disconnect/watchdog.
     pub fn release_all(&mut self) -> io::Result<()> {
-        let held: Vec<u16> = self.held_keys.drain().collect();
+        let held: Vec<u16> = self.held.drain().collect();
         for code in held {
             self.dev.emit(&[
                 evdev::InputEvent::new(evdev::EventType::KEY.0, code, 0),
@@ -1918,7 +2099,6 @@ async fn pair(dir: PathBuf, addr: &str, name: Option<String>) -> anyhow::Result<
 
 ```rust
 use anyhow::Context;
-use futures::StreamExt;
 use spacing_capture::EvdevCapture;
 use spacing_core::combo::parse_combo;
 use spacing_core::config::{load_config, Mode};
@@ -1928,7 +2108,7 @@ use spacing_core::router::{Decision, Router, Target};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -1966,7 +2146,8 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
     let cfg_path = cfg_path.unwrap_or_else(|| dir.join("config.toml"));
     let cfg = load_config(&cfg_path)?;
     anyhow::ensure!(cfg.mode == Mode::Server, "config mode must be \"server\"");
-    let peers = PeerStore::load(&dir.join("peers.toml"))?;
+    // Shared with every accept task — pairing inserts are visible immediately.
+    let peers = Arc::new(RwLock::new(PeerStore::load(&dir.join("peers.toml"))?));
     let id = spacing_net::cert::ensure_identity(&dir)?;
     tracing::info!(fp = %id.fingerprint, "identity loaded");
 
@@ -1980,7 +2161,6 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
     let mut cap = EvdevCapture::enumerate().context(
         "cannot capture /dev/input — add user to 'input' group or apply the udev rule in README",
     )?;
-    let mut events = cap.into_stream();
 
     let listener = TcpListener::bind(&cfg.bind).await?;
     tracing::info!(bind = %cfg.bind, pairing, "listening");
@@ -2024,12 +2204,16 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
             }
             Some(dead) = ctrl_rx.recv() => {
                 tracing::warn!(peer = %dead, "client lost");
+                let prev = router.target().clone();
                 conns.remove(&dead);
-                if matches!(router.target(), Target::Remote(n) if n == &dead) {
-                    to_local(&mut cap, &mut router, &conns).await;
+                if matches!(&prev, Target::Remote(n) if n == &dead) {
+                    to_local(&mut cap, &mut router, &conns, &prev).await;
                 }
             }
-            Some(ev) = events.next() => {
+            // cap.next_event() borrows `cap` only while pending — arms can
+            // grab()/ungrab() freely after it resolves.
+            Some(ev) = cap.next_event() => {
+                let prev = router.target().clone();
                 match router.on_event(ev) {
                     Decision::Drop => {}
                     Decision::Forward(e) => {
@@ -2042,15 +2226,32 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
                         }
                     }
                     Decision::SwitchToRemote(name) => {
-                        tracing::info!(target = %name, "switching to remote");
-                        if let Err(e) = cap.grab() {
-                            tracing::error!("grab failed: {e}");
+                        if !conns.contains_key(&name) {
+                            // hotkey targets a peer that isn't connected —
+                            // grabbing here would send input into the void.
+                            tracing::warn!(target = %name, "peer not connected — staying local");
                             router.on_disconnected();
+                        } else {
+                            tracing::info!(target = %name, "switching to remote");
+                            // remote->remote: tell the old client to release held keys
+                            if let Target::Remote(old) = &prev {
+                                if old != &name {
+                                    if let Some(tx) = conns.get(old) {
+                                        let _ = tx
+                                            .send_timeout(Message::ReleaseControl, SEND_TIMEOUT)
+                                            .await;
+                                    }
+                                }
+                            }
+                            if let Err(e) = cap.grab() {
+                                tracing::error!("grab failed: {e} — staying local");
+                                router.on_disconnected();
+                            }
                         }
                     }
                     Decision::SwitchToLocal => {
                         tracing::info!("back to local");
-                        to_local(&mut cap, &mut router, &conns).await;
+                        to_local(&mut cap, &mut router, &conns, &prev).await;
                     }
                 }
             }
@@ -2067,14 +2268,19 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
     }
 }
 
+/// Spec order: ReleaseControl → (client release_all) → ungrab → Local.
+/// `prev` is the target we just left — only it needs ReleaseControl.
 async fn to_local(
     cap: &mut EvdevCapture,
     router: &mut Router,
     conns: &HashMap<String, mpsc::Sender<Message>>,
+    prev: &Target,
 ) {
     router.on_disconnected();
-    for tx in conns.values() {
-        let _ = tx.send_timeout(Message::ReleaseControl, SEND_TIMEOUT).await;
+    if let Target::Remote(old) = prev {
+        if let Some(tx) = conns.get(old) {
+            let _ = tx.send_timeout(Message::ReleaseControl, SEND_TIMEOUT).await;
+        }
     }
     let _ = cap.ungrab();
 }
@@ -2098,8 +2304,8 @@ pub async fn run(_dir: PathBuf, _to: Option<String>, _cfg: Option<PathBuf>) -> a
 
 - [ ] **Step 4: Verify**
 
-Run: `cargo build --bin spacing && cargo test`
-Expected: compiles; existing tests pass.
+Run: `cargo build --bin spacing && cargo test --workspace`
+Expected: compiles; tất cả tests pass.
 
 - [ ] **Step 5: Commit**
 
@@ -2171,7 +2377,20 @@ pub async fn run(dir: PathBuf, to: Option<String>, cfg_path: Option<PathBuf>) ->
         tokio::select! {
             m = spacing_net::conn::recv_msg(&mut rd) => {
                 match m {
-                    Ok(Message::Input(ev)) => { inject.inject(&ev)?; last_rx = Instant::now(); released = false; }
+                    Ok(Message::Input(ev)) => {
+                        match inject.inject(&ev) {
+                            Ok(()) => { last_rx = Instant::now(); released = false; }
+                            Err(e) => {
+                                // spec §5: client báo Error → server về Local;
+                                // release phím đang giữ trước khi chết.
+                                let _ = spacing_net::conn::send_msg(&mut wr, &Message::Error {
+                                    code: 1, message: e.to_string(),
+                                }).await;
+                                let _ = inject.release_all();
+                                anyhow::bail!("inject failed: {e}");
+                            }
+                        }
+                    }
                     Ok(Message::Heartbeat) => { last_rx = Instant::now(); }
                     Ok(Message::ReleaseControl) => { inject.release_all()?; last_rx = Instant::now(); released = true; }
                     Ok(Message::HelloAck{..}) => { last_rx = Instant::now(); }
@@ -2201,8 +2420,8 @@ pub async fn run(dir: PathBuf, to: Option<String>, cfg_path: Option<PathBuf>) ->
 
 - [ ] **Step 2: Verify build**
 
-Run: `cargo build --bin spacing && cargo test`
-Expected: compiles clean.
+Run: `cargo build --bin spacing && cargo test --workspace`
+Expected: compiles clean; tất cả tests pass.
 
 - [ ] **Step 3: Commit**
 
@@ -2252,9 +2471,8 @@ Requires access to `/dev/input/event*` (server) and `/dev/uinput` (client):
 1. On BOTH: `cargo install --path .` (or `cargo build --release`)
 2. Server machine: `spacing fingerprint` → note fp; start `spacing serve --pairing` once.
 3. Client machine: `spacing pair <server-ip>:24800` → verify fp → `y`.
-4. Back on server: add client fp to `~/.config/spacing/peers.toml` is
-   automatic (pairing window registered it); restart `spacing serve`.
-5. Client: `spacing client --to <server-ip>:24800`.
+   Server lưu fingerprint client vào `peers.toml` ngay khi pair — không cần restart.
+4. Client: `spacing client --to <server-ip>:24800`.
 
 ## config.toml (server)
 
@@ -2262,15 +2480,27 @@ Requires access to `/dev/input/event*` (server) and `/dev/uinput` (client):
     bind = "0.0.0.0:24800"
     [server.hotkeys]
     local = "Ctrl+Alt+0"
-    "Ctrl+Alt+1" = "hostname-of-client"
+    "Ctrl+Alt+1" = "hostname-of-client"   # = giá trị `hostname` trên máy client
+                                        # (client gửi nó trong Hello/PairRequest)
+
+## Known limitations (P1)
+
+- Nhấn hotkey switch giữa lúc modifier (Ctrl/Alt) đang down → modifier có thể
+  "kẹt" trên máy server (key-down đã vào OS trước grab, key-up đi remote).
+  Workaround: nhấn-thả phím đó một lần. Fix đúng ở P5 (uinput key-up cục bộ).
+- IPv6 `host:port` không parse đúng (`host = addr.split(':').next()` — P1 chỉ
+  hỗ trợ IPv4/hostname).
+- Media/consumer keys (volume...) bị drop ở capture — keyboard page 0x07 only.
 
 ## Manual E2E checklist
 
 - [ ] `spacing serve` + `spacing client --to` connect, no errors
 - [ ] Type on server → chars appear on client after Ctrl+Alt+1
 - [ ] Ctrl+Alt+0 returns control locally instantly
+- [ ] Remote→remote (Ctrl+Alt+1 → Ctrl+Alt+2): client cũ không bị kẹt phím (ReleaseControl)
 - [ ] Kill client (`kill -9`) mid-typing → server ungrabs, local input works, client releases held keys (watchdog)
 - [ ] `spacing pair` from unknown client rejected when not --pairing
+- [ ] Scroll wheel trên client đúng tốc độ (không nhanh ×120)
 ```
 
 - [ ] **Step 2: Commit**
@@ -2286,8 +2516,16 @@ git commit -m "docs: README quickstart + udev rules + E2E checklist"
 
 - `connect_client` takes a verify closure: `|fp| peers.allow(fp)` for
   `client`, `|_| true` for `pair` (already reflected in Tasks 4 & 7).
-- Duplicate `peer_name` on connect: log warn and overwrite map entry.
+- `peer_name` = hostname client tự gửi trong `Hello`/`PairRequest` — tên trong
+  hotkey config phải khớp hostname đó. Duplicate name on connect: log warn,
+  overwrite map entry.
+- Wire messages dùng `Hello`/`HelloAck` và `PairAccept` không-mang-fingerprint —
+  cố ý đơn giản hoá so với spec (`ClientHello`/`ServerHello`,
+  `PairAccept{fingerprint}`): fingerprint đã biết ở TLS layer, không cần gửi lại.
+- `EvdevCapture` giữ `Vec<EventStream>`, KHÔNG `into_stream(self)` (consume
+  owner thì `grab()` không gọi được — `next_event()` là giải pháp).
 - Keystrokes MUST NOT be logged anywhere (Global Constraints).
 - If `evdev::uinput` API drifts (crate version), adapt — contract is the
-  `to_evdev` map tests, which are version-independent.
+  `to_evdev`/`map_event` map tests, which are version-independent. Tương tự
+  với `EventStream::get_mut` (0.12.x cũ có thể gọi là `device_mut`).
 - All tasks assume repo root `/home/k0walski/Code/spacing`, git initialized.
