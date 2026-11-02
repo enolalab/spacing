@@ -1069,7 +1069,7 @@ license.workspace = true
 spacing-core = { path = "../spacing-core" }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }  # 0.23.17+ default provider là aws_lc_rs — phải bật ring rõ ràng
 rustls-pemfile = "2"
 rcgen = "0.13"
 sha2 = "0.10"
@@ -1156,7 +1156,12 @@ pub async fn accept_server(
         .with_client_cert_verifier(verifier)
         .with_single_cert(id.certs.clone(), id.key.clone_key())
         .context("server tls config")?;
-    let stream = TlsAcceptor::from(Arc::new(cfg)).accept(tcp).await?;
+    // accept()/connect() trả server::/client::TlsStream — .into() sang enum
+    // TlsStream chung để dùng chung type Rd/Wr.
+    let stream: TlsStream<_> = TlsAcceptor::from(Arc::new(cfg))
+        .accept(tcp)
+        .await?
+        .into();
     let peer_fp = peer_fp(&stream)?;
     let paired = peers.read().unwrap().allow(&peer_fp);
     if !paired && !pairing_open.load(Ordering::Relaxed) {
@@ -1215,9 +1220,10 @@ pub async fn connect_client(
         .context("client tls config")?;
     let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
         .map_err(|_| anyhow!("invalid server name {server_name}"))?;
-    let stream = TlsConnector::from(Arc::new(cfg))
+    let stream: TlsStream<_> = TlsConnector::from(Arc::new(cfg))
         .connect(name, tcp)
-        .await?;
+        .await?
+        .into();
     let peer_fp = peer_fp(&stream)?;
     anyhow::ensure!(
         verify(&peer_fp),
@@ -1356,8 +1362,8 @@ impl ClientCertVerifier for PairingVerifier {
     fn client_auth_mandatory(&self) -> bool {
         true
     }
-    fn root_hint_subjects(&self) -> Result<Vec<DistinguishedName>, Error> {
-        Ok(vec![])
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
     }
     fn verify_client_cert(
         &self, end: &CertificateDer<'_>, _inter: &[CertificateDer<'_>],
