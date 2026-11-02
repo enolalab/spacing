@@ -77,8 +77,10 @@ Portable static build (any Linux): `./contrib/build-static.sh` →
 ### Permissions (required, both machines)
 
 **Portal backend (Wayland, GNOME 45+/KDE 6.1+):** nothing — the portal
-mediates device access. The controlled machine approves a RemoteDesktop
-dialog the first time it runs `spacing client`.
+mediates device access. GNOME shows a permission dialog per start
+(server: *"Capture Input"*, client: *RemoteDesktop*); approve it once per
+run — or automate it via `contrib/portal-approve.py` (AT-SPI helper for
+headless/smoke testing). KDE grants InputCapture without a prompt.
 
 **evdev backend (default on X11/headless):** spacing reads real input
 devices (`/dev/input/event*`) and creates a virtual device (`/dev/uinput`):
@@ -151,7 +153,9 @@ backend = "auto"                # same selection as the server
 ```
 
 On the portal backend the client machine shows a **RemoteDesktop dialog**
-the first time it connects — approve it to allow input injection.
+on each connect — approve it to allow input injection (toggle "Allow
+Remote Interaction", then *Share*; `contrib/portal-approve.py` does this
+automatically via AT-SPI).
 
 ## Security model
 
