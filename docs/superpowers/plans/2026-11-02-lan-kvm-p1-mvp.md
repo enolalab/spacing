@@ -653,16 +653,17 @@ impl Router {
     pub fn on_event(&mut self, ev: InputEvent) -> Decision {
         match ev {
             InputEvent::KeyDown(hid) => {
-                // hotkey check BEFORE recording/forwarding
+                // hotkey check BEFORE recording/forwarding.
+                // NOTE: `held` is NOT cleared on switch — modifiers remain
+                // physically held, and hotkeys must keep matching (e.g.
+                // Ctrl+Alt+1 → Ctrl+Alt+0 without re-pressing modifiers).
                 if self.matches(&self.hotkey_local, hid) {
                     self.target = Target::Local;
-                    self.held.clear();
                     return Decision::SwitchToLocal;
                 }
                 for (combo, name) in &self.hotkey_switch {
                     if self.matches(combo, hid) {
                         self.target = Target::Remote(name.clone());
-                        self.held.clear();
                         return Decision::SwitchToRemote(name.clone());
                     }
                 }
