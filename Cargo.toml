@@ -29,3 +29,4 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 gethostname = "0.5"
+evdev = "0.12" # for src/bin/e2e.rs test tool

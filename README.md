@@ -41,13 +41,34 @@ Client config (optional — có thể dùng `--to` thay):
 - IPv6 `host:port` không parse đúng (`host = addr.split(':').next()` — P1 chỉ
   hỗ trợ IPv4/hostname).
 - Media/consumer keys (volume...) bị drop ở capture — keyboard page 0x07 only.
+- Không hotplug: thiết bị cắm SAU khi `serve` chạy sẽ không được capture
+  (enumerate một lần lúc start). Restart `serve` sau khi cắm thiết bị mới.
+
+## Dev: VM E2E (multipass)
+
+Đã verify trên 2 VM Ubuntu 24.04 (`multipass`):
+
+    ./contrib/build-static.sh          # static binary, chạy được mọi glibc
+    multipass transfer target/x86_64-unknown-linux-gnu/release/spacing <vm>:
+
+`src/bin/e2e.rs` — helper tạo/đọc evdev không cần quyền thêm:
+
+    e2e emit [delay]       # tạo uinput kbd "e2e-kbd", gửi Ctrl+Alt+1, "hello", Ctrl+Alt+0
+    e2e emit-hold [delay]  # Ctrl+Alt+1 rồi giữ remote 30s, sau đó bắn KEY_Q
+                           # (dùng với `e2e listen e2e-kbd` để chứng minh ungrab)
+    e2e listen <substr>    # in raw evdev events của thiết bị tên chứa <substr>
+
+Đã verify thực tế (2026-11-02): pair + fingerprint pin, reconnect không cần
+--pairing, Ctrl+Alt+1 → "hello" tới client, Ctrl+Alt+0 → local, kill -9 client
+giữa remote → server ungrab & local input hoạt động lại.
 
 ## Manual E2E checklist
 
-- [ ] `spacing serve` + `spacing client --to` connect, no errors
-- [ ] Type on server → chars appear on client after Ctrl+Alt+1
-- [ ] Ctrl+Alt+0 returns control locally instantly
-- [ ] Remote→remote (Ctrl+Alt+1 → Ctrl+Alt+2): client cũ không bị kẹt phím (ReleaseControl)
-- [ ] Kill client (`kill -9`) mid-typing → server ungrabs, local input works, client releases held keys (watchdog)
-- [ ] `spacing pair` from unknown client rejected when not --pairing
-- [ ] Scroll wheel trên client đúng tốc độ (không nhanh ×120)
+- [x] `spacing serve` + `spacing client --to` connect, no errors
+- [x] Type on server → chars appear on client after Ctrl+Alt+1
+- [x] Ctrl+Alt+0 returns control locally instantly
+- [ ] Remote→remote (Ctrl+Alt+1 → Ctrl+Alt+2): client cũ không bị kẹt phím (ReleaseControl) — cần 3 VM
+- [x] Kill client (`kill -9`) mid-typing → server ungrabs, local input works
+- [ ] Client releases held keys (watchdog) — khó quan sát headless, đã cover bằng unit logic
+- [ ] `spacing pair` from unknown client rejected when not --pairing — cover ở `spacing-net` loopback test
+- [ ] Scroll wheel trên client đúng tốc độ (không nhanh ×120) — cover ở `to_evdev` map test
