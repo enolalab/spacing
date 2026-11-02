@@ -1,9 +1,11 @@
 pub mod map;
+pub mod portal;
 
 use futures::stream;
 use futures::StreamExt as _;
 use spacing_core::config::Backend;
 use spacing_core::event::InputEvent;
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
@@ -33,20 +35,34 @@ pub trait CaptureBackend: Send {
     async fn next_event(&mut self) -> Option<CaptureEvent>;
 }
 
-/// Pick a capture backend. `Auto`: Wayland portal when implemented and
-/// the session supports it, else evdev (kernel-level, works everywhere).
-pub fn select_capture(backend: Backend) -> io::Result<Box<dyn CaptureBackend>> {
+/// Screen-edge → client map for portal barrier switching.
+pub type EdgeMap = BTreeMap<String, String>;
+
+/// Pick a capture backend. `Auto`: Wayland portal when the session can
+/// provide it, else evdev (kernel-level, works everywhere).
+pub async fn select_capture(
+    backend: Backend,
+    edges: &EdgeMap,
+) -> io::Result<Box<dyn CaptureBackend>> {
     match backend {
-        Backend::Evdev | Backend::Auto => {
-            if matches!(backend, Backend::Auto) && wayland_session() {
-                tracing::info!("Wayland session — portal backend pending, using evdev");
+        Backend::Evdev => EvdevCapture::enumerate().map(|c| Box::new(c) as _),
+        Backend::Portal => portal::PortalCapture::connect(edges)
+            .await
+            .map(|c| Box::new(c) as _),
+        Backend::Auto => {
+            if wayland_session() {
+                match portal::PortalCapture::connect(edges).await {
+                    Ok(c) => {
+                        tracing::info!("Wayland portal backend active (InputCapture/libei)");
+                        return Ok(Box::new(c));
+                    }
+                    Err(e) => {
+                        tracing::warn!("portal backend unavailable ({e}) — falling back to evdev");
+                    }
+                }
             }
             EvdevCapture::enumerate().map(|c| Box::new(c) as _)
         }
-        Backend::Portal => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "portal backend not built yet — use backend = \"evdev\" or \"auto\"",
-        )),
     }
 }
 
@@ -181,16 +197,17 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
 
-    #[test]
-    fn explicit_portal_backend_errors_until_built() {
-        let e = select_capture(Backend::Portal).err().unwrap();
-        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+    #[tokio::test]
+    async fn explicit_portal_backend_attempts_without_panic() {
+        // On a Wayland host this creates a real portal session; on
+        // headless CI it errors — either way it must not panic.
+        let _ = select_capture(Backend::Portal, &EdgeMap::new()).await;
     }
 
-    #[test]
-    fn explicit_evdev_backend_does_not_panic() {
+    #[tokio::test]
+    async fn explicit_evdev_backend_does_not_panic() {
         // Result depends on the machine's /dev/input — only contract is
         // "returns, never panics".
-        let _ = select_capture(Backend::Evdev);
+        let _ = select_capture(Backend::Evdev, &EdgeMap::new()).await;
     }
 }

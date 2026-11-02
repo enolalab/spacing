@@ -26,15 +26,22 @@ pub struct Router {
     target: Target,
     hotkey_local: Combo,
     hotkey_switch: Vec<(Combo, String)>,
+    /// Screen-edge name → client name (portal barrier switching).
+    edges: std::collections::BTreeMap<String, String>,
     held: HashSet<u16>,
 }
 
 impl Router {
-    pub fn new(hotkey_local: Combo, hotkey_switch: Vec<(Combo, String)>) -> Self {
+    pub fn new(
+        hotkey_local: Combo,
+        hotkey_switch: Vec<(Combo, String)>,
+        edges: std::collections::BTreeMap<String, String>,
+    ) -> Self {
         Self {
             target: Target::Local,
             hotkey_local,
             hotkey_switch,
+            edges,
             held: HashSet::new(),
         }
     }
@@ -47,6 +54,27 @@ impl Router {
     pub fn on_disconnected(&mut self) {
         self.target = Target::Local;
         self.held.clear();
+    }
+
+    /// Portal barrier activation — `edge` is the configured edge name
+    /// ("left"/"right"/"top"/"bottom"), resolved to a client name here.
+    pub fn on_edge(&mut self, edge: &str) -> Decision {
+        let Some(name) = self.edges.get(edge).cloned() else {
+            return Decision::Drop;
+        };
+        self.target = Target::Remote(name.clone());
+        Decision::SwitchToRemote(name)
+    }
+
+    /// Portal capture ended (ESC pressed / release / session lost).
+    pub fn on_capture_end(&mut self) -> Decision {
+        match self.target {
+            Target::Remote(_) => {
+                self.target = Target::Local;
+                Decision::SwitchToLocal
+            }
+            Target::Local => Decision::Drop,
+        }
     }
 
     fn mods(&self) -> ModSet {
@@ -120,6 +148,9 @@ mod tests {
         Router::new(
             parse_combo("Ctrl+Alt+0").unwrap(),
             vec![(parse_combo("Ctrl+Alt+1").unwrap(), "laptop".into())],
+            [("right".to_string(), "laptop".to_string())]
+                .into_iter()
+                .collect(),
         )
     }
 
@@ -184,5 +215,28 @@ mod tests {
         r.on_disconnected();
         assert_eq!(r.target(), &Target::Local);
         assert_eq!(r.on_event(KeyDown(KA)), Decision::Drop);
+    }
+
+    #[test]
+    fn edge_switches_to_mapped_client() {
+        let mut r = router();
+        assert_eq!(r.on_edge("right"), Decision::SwitchToRemote("laptop".into()));
+        assert!(matches!(r.target(), Target::Remote(_)));
+    }
+
+    #[test]
+    fn unknown_edge_drops() {
+        let mut r = router();
+        assert_eq!(r.on_edge("left"), Decision::Drop);
+        assert_eq!(r.target(), &Target::Local);
+    }
+
+    #[test]
+    fn capture_end_returns_to_local_only_when_remote() {
+        let mut r = router();
+        assert_eq!(r.on_capture_end(), Decision::Drop); // local — nothing to do
+        r.on_edge("right");
+        assert_eq!(r.on_capture_end(), Decision::SwitchToLocal);
+        assert_eq!(r.target(), &Target::Local);
     }
 }

@@ -41,6 +41,16 @@ fn default_bind() -> String {
 pub struct ServerCfg {
     #[serde(default)]
     pub hotkeys: HotkeysCfg,
+    #[serde(default)]
+    pub layout: LayoutCfg,
+}
+
+/// Screen-edge → client mapping for portal barrier switching:
+/// `[server.layout.edges] right = "laptop"`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LayoutCfg {
+    #[serde(default)]
+    pub edges: BTreeMap<String, String>,
 }
 
 /// `local` is the switch-back combo; every other entry is
@@ -100,5 +110,16 @@ mod tests {
             .unwrap();
             assert_eq!(cfg.backend, want, "{raw}");
         }
+    }
+
+    #[test]
+    fn parses_layout_edges() {
+        let cfg: Config = toml::from_str(
+            "mode = \"server\"\n[server.layout.edges]\nright = \"laptop\"\nleft = \"desktop\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.server.layout.edges["right"], "laptop");
+        assert_eq!(cfg.server.layout.edges["left"], "desktop");
+        assert!(!cfg.server.layout.edges.contains_key("top"));
     }
 }

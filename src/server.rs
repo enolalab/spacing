@@ -77,11 +77,13 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
     for (combo_s, name) in &cfg.server.hotkeys.switch {
         switch.push((parse_combo(combo_s)?, name.clone()));
     }
-    let mut router = Router::new(local, switch);
+    let mut router = Router::new(local, switch, cfg.server.layout.edges.clone());
 
-    let mut cap = select_capture(cfg.backend).context(
-        "cannot initialize input capture — check backend config, input group, or the udev rule in README",
-    )?;
+    let mut cap = select_capture(cfg.backend, &cfg.server.layout.edges)
+        .await
+        .context(
+            "cannot initialize input capture — check backend config, input group, or the udev rule in README",
+        )?;
 
     let listener = TcpListener::bind(&cfg.bind).await?;
     tracing::info!(bind = %cfg.bind, pairing, "listening");
@@ -151,15 +153,30 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
             // cap.next_event() borrows `cap` only while pending — arms can
             // grab()/ungrab() freely after it resolves.
             Some(cev) = cap.next_event() => {
+                // Portal edge/lifecycle events drive the same decisions
+                // hotkeys do — then we're done with this iteration.
                 let ev = match cev {
                     CaptureEvent::Input(ev) => ev,
-                    // Portal edge events — wired to the router in T6.
-                    CaptureEvent::Activated { ref zone } => {
-                        tracing::info!(%zone, "capture barrier activated");
+                    CaptureEvent::Activated { zone } => {
+                        let prev = router.target().clone();
+                        match router.on_edge(&zone) {
+                            Decision::SwitchToRemote(name) => {
+                                tracing::info!(%zone, target = %name, "edge switch");
+                                do_remote_switch(
+                                    &name, &prev, &conns, &mut *cap, &mut router,
+                                    &mut *clip, &mut clip_dedup,
+                                ).await;
+                            }
+                            d => tracing::warn!(%zone, ?d, "edge activation not mapped"),
+                        }
                         continue;
                     }
                     CaptureEvent::Deactivated => {
-                        tracing::info!("capture deactivated");
+                        let prev = router.target().clone();
+                        if matches!(router.on_capture_end(), Decision::SwitchToLocal) {
+                            tracing::info!("capture released — back to local");
+                            to_local(&mut *cap, &mut router, &conns, &prev).await;
+                        }
                         continue;
                     }
                 };
@@ -176,43 +193,10 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
                         }
                     }
                     Decision::SwitchToRemote(name) => {
-                        if !conns.contains_key(&name) {
-                            // hotkey targets a peer that isn't connected —
-                            // grabbing here would send input into the void.
-                            tracing::warn!(target = %name, "peer not connected — staying local");
-                            router.on_disconnected();
-                        } else {
-                            tracing::info!(target = %name, "switching to remote");
-                            // remote->remote: tell the old client to release held keys
-                            if let Target::Remote(old) = &prev {
-                                if old != &name {
-                                    if let Some(tx) = conns.get(old) {
-                                        let _ = tx
-                                            .send_timeout(Message::ReleaseControl, SEND_TIMEOUT)
-                                            .await;
-                                    }
-                                }
-                            }
-                            if let Err(e) = cap.grab().await {
-                                tracing::error!("grab failed: {e} — staying local");
-                                router.on_disconnected();
-                            } else {
-                                // spec: push local clipboard on switch
-                                if let Ok(cur) = clip.get_text() {
-                                    let _ = clip_dedup.poll(cur.as_deref()); // mark seen
-                                    if let Some(text) = cur.filter(|t| t.len() <= CLIPBOARD_MAX) {
-                                        if let Some(tx) = conns.get(&name) {
-                                            let _ = tx
-                                                .send_timeout(
-                                                    Message::ClipboardSet { text },
-                                                    SEND_TIMEOUT,
-                                                )
-                                                .await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        do_remote_switch(
+                            &name, &prev, &conns, &mut *cap, &mut router,
+                            &mut *clip, &mut clip_dedup,
+                        ).await;
                     }
                     Decision::SwitchToLocal => {
                         tracing::info!("back to local");
@@ -247,6 +231,57 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
                         tracing::warn!("clipboard >1MiB — not forwarded");
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Shared switch-to-remote sequence for hotkeys AND edge crossings:
+/// peer check → release old remote → grab → push clipboard.
+/// On failure paths the capture is released so the user is never left
+/// without local input (critical on the portal backend, where the edge
+/// activation has already captured the pointer).
+#[allow(clippy::too_many_arguments)]
+async fn do_remote_switch(
+    name: &str,
+    prev: &Target,
+    conns: &HashMap<String, mpsc::Sender<Message>>,
+    cap: &mut dyn CaptureBackend,
+    router: &mut Router,
+    clip: &mut dyn spacing_inject::clipboard::Clipboard,
+    clip_dedup: &mut ClipDedup,
+) {
+    if !conns.contains_key(name) {
+        // switching to a peer that isn't connected would send input
+        // into the void — release capture instead of losing it.
+        tracing::warn!(target = %name, "peer not connected — staying local");
+        router.on_disconnected();
+        let _ = cap.ungrab().await;
+        return;
+    }
+    tracing::info!(target = %name, "switching to remote");
+    // remote->remote: tell the old client to release held keys
+    if let Target::Remote(old) = prev {
+        if old != name {
+            if let Some(tx) = conns.get(old) {
+                let _ = tx.send_timeout(Message::ReleaseControl, SEND_TIMEOUT).await;
+            }
+        }
+    }
+    if let Err(e) = cap.grab().await {
+        tracing::error!("grab failed: {e} — staying local");
+        router.on_disconnected();
+        let _ = cap.ungrab().await;
+        return;
+    }
+    // spec: push local clipboard on switch
+    if let Ok(cur) = clip.get_text() {
+        let _ = clip_dedup.poll(cur.as_deref()); // mark seen
+        if let Some(text) = cur.filter(|t| t.len() <= CLIPBOARD_MAX) {
+            if let Some(tx) = conns.get(name) {
+                let _ = tx
+                    .send_timeout(Message::ClipboardSet { text }, SEND_TIMEOUT)
+                    .await;
             }
         }
     }

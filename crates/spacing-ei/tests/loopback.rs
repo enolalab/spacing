@@ -98,7 +98,7 @@ fn eis_emits_ei_receiver_decodes() {
         ));
         let mut conv = EisRequestConverter::new(&ctx, resp, 1);
         let conn = conv.handle().clone();
-        conn.add_seat(Some("test-seat"), caps());
+        let _seat = conn.add_seat(Some("test-seat"), caps());
         ctx.flush().unwrap();
 
         let device = wait_bind_make_device(&ctx, &mut conv);
@@ -188,7 +188,7 @@ fn ei_sender_emits_eis_receives() {
         ));
         let mut conv = EisRequestConverter::new(&ctx, resp, 1);
         let conn = conv.handle().clone();
-        conn.add_seat(Some("test-seat"), caps());
+        let _seat = conn.add_seat(Some("test-seat"), caps());
         ctx.flush().unwrap();
 
         let mut bound = false;
