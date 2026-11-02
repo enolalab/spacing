@@ -30,7 +30,13 @@ impl SendInputInject {
     }
 
     fn send(inputs: &mut [INPUT]) -> io::Result<()> {
-        let n = unsafe { SendInput(inputs.len() as u32, inputs.as_mut_ptr(), 1) };
+        let n = unsafe {
+            SendInput(
+                inputs.len() as u32,
+                inputs.as_mut_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            )
+        };
         if n as usize != inputs.len() {
             return Err(io::Error::last_os_error());
         }

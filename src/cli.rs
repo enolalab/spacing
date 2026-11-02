@@ -36,6 +36,13 @@ pub enum Cmd {
     },
     /// Print this machine's cert fingerprint.
     Fingerprint,
+    /// Dump captured events to stdout (debug/VM testing).
+    #[command(hide = true)]
+    CaptureDump {
+        /// edge names to arm for edge switching (e.g. --edge right)
+        #[arg(long)]
+        edge: Vec<String>,
+    },
 }
 
 #[cfg(test)]

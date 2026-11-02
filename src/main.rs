@@ -32,7 +32,28 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", id.fingerprint);
             Ok(())
         }
+        cli::Cmd::CaptureDump { edge } => capture_dump(edge).await,
     }
+}
+
+/// Debug helper: run the native capture backend alone and print every
+/// event — verifies hooks/taps + keymap + edge detection without any
+/// network or a second machine.
+async fn capture_dump(edge: Vec<String>) -> anyhow::Result<()> {
+    use spacing_capture::{select_capture, CaptureEvent, EdgeMap};
+    let edges: EdgeMap = edge.iter().map(|e| (e.clone(), e.clone())).collect();
+    let mut cap = select_capture(Default::default(), &edges).await?;
+    // No grab() — hook events are mirrored regardless, and staying
+    // ungrabbed keeps edge detection armed (grab = suppress + edge off).
+    println!("capture-dump ready edges={edge:?}");
+    while let Some(ev) = cap.next_event().await {
+        match ev {
+            CaptureEvent::Input(e) => println!("input {e:?}"),
+            CaptureEvent::Activated { zone } => println!("activated zone={zone}"),
+            CaptureEvent::Deactivated => println!("deactivated"),
+        }
+    }
+    Ok(())
 }
 
 async fn pair(dir: PathBuf, addr: &str, name: Option<String>) -> anyhow::Result<()> {

@@ -57,13 +57,17 @@ impl EdgeDetector {
         }
     }
 
-    /// Whether `(x, y)` sits at (or beyond) the named edge.
-    fn clamped(&self, edge: &str, x: i32, y: i32) -> bool {
+    /// Whether `(x, y)` sits inside the named edge's tolerance zone.
+    /// A few px of inward wiggle keeps the cursor "at the edge" —
+    /// hi-res mice and emulated devices jitter ±1px at the clamp, and
+    /// that noise must not count as pulling away.
+    fn in_zone(&self, edge: &str, x: i32, y: i32) -> bool {
+        const TOL: i32 = 4;
         match edge {
-            "right" => x >= self.max_x,
-            "left" => x <= self.min_x,
-            "bottom" => y >= self.max_y,
-            "top" => y <= self.min_y,
+            "right" => x >= self.max_x - TOL,
+            "left" => x <= self.min_x + TOL,
+            "bottom" => y >= self.max_y - TOL,
+            "top" => y <= self.min_y + TOL,
             _ => false,
         }
     }
@@ -93,9 +97,15 @@ impl EdgeDetector {
                 "top" => dy <= 0,
                 _ => false,
             };
-            let pushing = dir && self.clamped(&edge, x, y);
+            let zone = self.in_zone(&edge, x, y);
+            let pushing = dir && zone;
             if !pushing {
-                self.streaks.remove(&edge);
+                // Neutral vs reset: an inward move that stays inside the
+                // edge zone is jitter, not a pull-away — only leaving
+                // the zone resets the streak.
+                if !zone {
+                    self.streaks.remove(&edge);
+                }
                 continue;
             }
             let entry = self.streaks.entry(edge.clone()).or_insert((0, now));
@@ -167,6 +177,19 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(d.feed_at(1919, 500, 0, 0, t), None); // right ignored
         }
+    }
+
+    #[test]
+    fn jitter_at_edge_does_not_reset() {
+        let mut d = det(&["right"]);
+        let t = Instant::now();
+        // Emulated/hi-res devices report ±1 corrections at the clamp —
+        // an inward wiggle inside the tolerance zone is neutral, not a
+        // pull-away; the push streak must survive it.
+        assert_eq!(d.feed_at(1919, 500, 10, 0, t), None); // push 1
+        assert_eq!(d.feed_at(1919, 500, 1, 0, t), None); // push 2
+        assert_eq!(d.feed_at(1918, 500, -1, 0, t), None); // jitter — neutral
+        assert_eq!(d.feed_at(1919, 500, 1, 0, t), Some("right".into())); // push 3
     }
 
     #[test]
