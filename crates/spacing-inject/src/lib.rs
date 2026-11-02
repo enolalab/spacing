@@ -1,5 +1,6 @@
 pub mod clipboard;
 pub mod map;
+pub mod portal;
 
 use evdev::uinput::VirtualDeviceBuilder;
 use evdev::{AttributeSet, Key, RelativeAxisType};
@@ -20,16 +21,34 @@ pub trait InjectionBackend: Send {
     async fn release_all(&mut self) -> io::Result<()>;
 }
 
-/// Pick an injection backend. `Auto`: portal when implemented and the
-/// session supports it, else uinput.
-pub fn select_inject(backend: Backend) -> io::Result<Box<dyn InjectionBackend>> {
+/// Pick an injection backend. `Auto`: RemoteDesktop portal on Wayland
+/// when available, else uinput (kernel-level, works everywhere).
+pub async fn select_inject(backend: Backend) -> io::Result<Box<dyn InjectionBackend>> {
     match backend {
-        Backend::Evdev | Backend::Auto => UinputInject::create().map(|i| Box::new(i) as _),
-        Backend::Portal => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "portal backend not built yet — use backend = \"evdev\" or \"auto\"",
-        )),
+        Backend::Evdev => UinputInject::create().map(|i| Box::new(i) as _),
+        Backend::Portal => portal::PortalInject::connect()
+            .await
+            .map(|i| Box::new(i) as _),
+        Backend::Auto => {
+            if wayland_session() {
+                match portal::PortalInject::connect().await {
+                    Ok(i) => {
+                        tracing::info!("Wayland portal backend active (RemoteDesktop/libei)");
+                        return Ok(Box::new(i));
+                    }
+                    Err(e) => {
+                        tracing::warn!("portal backend unavailable ({e}) — falling back to uinput");
+                    }
+                }
+            }
+            UinputInject::create().map(|i| Box::new(i) as _)
+        }
     }
+}
+
+fn wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var("XDG_SESSION_TYPE").map_or(true, |v| v == "wayland")
 }
 
 /// Virtual keyboard+mouse created via /dev/uinput.
@@ -126,8 +145,10 @@ mod select_tests {
     use super::*;
 
     #[test]
-    fn explicit_portal_backend_errors_until_built() {
-        let e = select_inject(Backend::Portal).err().unwrap();
-        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+    fn uinput_selection_attempts_without_panic() {
+        // Result depends on /dev/uinput access — only contract is
+        // "returns, never panics". (Portal needs an async runtime +
+        // a live session and is exercised in host smoke tests.)
+        let _ = UinputInject::create();
     }
 }

@@ -1736,9 +1736,15 @@ name = "spacing-inject"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "ashpd",
  "async-trait",
+ "enumflags2",
  "evdev",
+ "futures",
+ "reis",
  "spacing-core",
+ "spacing-ei",
+ "tokio",
  "tracing",
 ]
 

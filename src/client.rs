@@ -41,6 +41,7 @@ pub async fn run(dir: PathBuf, to: Option<String>, cfg_path: Option<PathBuf>) ->
 
     let backend = cfg.map(|c| c.backend).unwrap_or_default();
     let mut inject = select_inject(backend)
+        .await
         .context("cannot initialize input injection — check backend config or the udev rule in README")?;
     let mut last_rx = Instant::now();
     let mut released = true;
