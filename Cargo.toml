@@ -13,6 +13,10 @@ name = "spacing"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+description = "LAN software KVM — share one keyboard and mouse between computers (no screen video, just input)"
+repository = "https://github.com/enolalab/spacing"
+keywords = ["kvm", "keyboard", "mouse", "lan", "input-sharing"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 spacing-core = { path = "crates/spacing-core" }
