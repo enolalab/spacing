@@ -20,6 +20,7 @@ use spacing_core::keymap_win::scan_to_evdev;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
+use tokio::sync::mpsc as tmpsc;
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -28,7 +29,7 @@ struct Shared {
     /// true ⇒ hooks swallow events (remote control active).
     suppress: AtomicBool,
     /// Events destined for the server select loop.
-    tx: mpsc::Sender<CaptureEvent>,
+    tx: tmpsc::UnboundedSender<CaptureEvent>,
     /// Screen-edge watcher — only consulted while !suppress.
     edge: Mutex<EdgeDetector>,
     /// Last reported cursor position (for motion deltas).
@@ -163,14 +164,14 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
 /// Capture backend driven by Win32 low-level hooks.
 /// The hook thread lives for the process lifetime.
 pub struct WinHooksCapture {
-    rx: mpsc::Receiver<CaptureEvent>,
+    rx: tmpsc::UnboundedReceiver<CaptureEvent>,
 }
 
 impl WinHooksCapture {
     /// Install both hooks and start the pump thread. `edges` selects
     /// which screen edges arm the switch (virtual-screen rect).
     pub fn connect(edges: &EdgeMap) -> io::Result<Self> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = tmpsc::unbounded_channel();
         let rect = unsafe {
             (
                 GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -259,12 +260,6 @@ impl crate::CaptureBackend for WinHooksCapture {
     }
 
     async fn next_event(&mut self) -> Option<CaptureEvent> {
-        // std::mpsc recv is blocking — hop on the blocking pool so the
-        // async select loop keeps ticking.
-        let rx = &mut self.rx;
-        match tokio::task::block_in_place(|| rx.recv()) {
-            Ok(ev) => Some(ev),
-            Err(_) => None,
-        }
+        self.rx.recv().await
     }
 }

@@ -18,6 +18,7 @@ use std::ffi::c_void;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
+use tokio::sync::mpsc as tmpsc;
 
 // --- minimal CoreGraphics/CoreFoundation FFI (stable C ABI) -------------
 
@@ -130,7 +131,7 @@ fn flag_bit(cg: u16) -> Option<u64> {
 
 struct Shared {
     suppress: AtomicBool,
-    tx: mpsc::Sender<CaptureEvent>,
+    tx: tmpsc::UnboundedSender<CaptureEvent>,
     edge: Mutex<EdgeDetector>,
     last_pt: Mutex<(f64, f64)>,
 }
@@ -253,14 +254,14 @@ fn event_mask() -> u64 {
 // --- backend ------------------------------------------------------------
 
 pub struct CgTapCapture {
-    rx: mpsc::Receiver<CaptureEvent>,
+    rx: tmpsc::UnboundedReceiver<CaptureEvent>,
 }
 
 impl CgTapCapture {
     /// Create the event tap on a run-loop thread. `edges` arms the
     /// screen-edge switch (main-display bounds).
     pub fn connect(edges: &EdgeMap) -> io::Result<Self> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = tmpsc::unbounded_channel();
         let b = unsafe { CGDisplayBounds(CGMainDisplayID()) };
         let rect = (
             b.origin.x as i32,
@@ -337,9 +338,6 @@ impl crate::CaptureBackend for CgTapCapture {
     }
 
     async fn next_event(&mut self) -> Option<CaptureEvent> {
-        match tokio::task::block_in_place(|| self.rx.recv()) {
-            Ok(ev) => Some(ev),
-            Err(_) => None,
-        }
+        self.rx.recv().await
     }
 }
