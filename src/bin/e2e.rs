@@ -4,9 +4,9 @@
 //   e2e listen <substr>     find /dev/input device whose name contains
 //                           <substr>, print events as "<type> <code> <value>"
 use evdev::uinput::VirtualDeviceBuilder;
-use evdev::{AttributeSet, EventType, InputEvent, Key};
-use std::io;
-use std::time::Duration;
+use evdev::{AttributeSet, EventType, InputEvent, Key, RelativeAxisType};
+use std::io::{self, Write};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn ev(t: EventType, c: u16, v: i32) -> InputEvent {
     InputEvent::new(t, c, v)
@@ -97,7 +97,60 @@ fn cmd_emit_hold(delay_secs: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn cmd_listen(needle: &str) -> io::Result<()> {
+fn now_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
+
+/// Benchmark emitter: Ctrl+Alt+1 then `count` events spaced `interval_ms`.
+/// Prints "E <t0_ns> <seq>" per event — pair with `listen --ts` output
+/// ("R <t1_ns> ...") to compute per-event e2e latency (same clock only).
+/// mode: "key" = KEY_H presses; "mouse" = REL_X +5.
+fn cmd_emit_bench(delay_secs: u64, count: u32, interval_ms: u64, mouse: bool) -> io::Result<()> {
+    let mut keys = AttributeSet::<Key>::new();
+    for c in 30u16..=38 {
+        keys.insert(Key::new(c));
+    }
+    for c in [LEFTCTRL, LEFTALT, KEY_1, 35] {
+        keys.insert(Key::new(c)); // 35 = KEY_H
+    }
+    let mut axes = AttributeSet::<RelativeAxisType>::new();
+    axes.insert(RelativeAxisType::REL_X);
+    axes.insert(RelativeAxisType::REL_Y);
+    let mut dev = VirtualDeviceBuilder::new()?
+        .name("e2e-kbd")
+        .with_keys(&keys)?
+        .with_relative_axes(&axes)?
+        .build()?;
+    eprintln!("e2e-kbd bench up; firing in {delay_secs}s");
+    std::thread::sleep(Duration::from_secs(delay_secs));
+
+    emit(&mut dev, LEFTCTRL, 1)?;
+    emit(&mut dev, LEFTALT, 1)?;
+    press(&mut dev, KEY_1)?; // -> remote
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut out = io::stdout().lock();
+    for i in 0..count {
+        let t0 = now_ns();
+        if mouse {
+            dev.emit(&[ev(EventType::RELATIVE, 0, 5), ev(EventType::SYNCHRONIZATION, 0, 0)])?;
+        } else {
+            press(&mut dev, 35)?;
+        }
+        writeln!(out, "E {t0} {i}")?;
+        out.flush()?;
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+    // keep device alive briefly so trailing events are delivered
+    std::thread::sleep(Duration::from_secs(2));
+    eprintln!("emit-bench done");
+    Ok(())
+}
+
+fn cmd_listen(needle: &str, with_ts: bool) -> io::Result<()> {
     let mut found = None;
     for (path, device) in evdev::enumerate() {
         if device.name().unwrap_or("").contains(needle) {
@@ -113,6 +166,7 @@ fn cmd_listen(needle: &str) -> io::Result<()> {
         }
     };
     eprintln!("listening on {path:?} ({:?})", device.name().unwrap_or(""));
+    let mut out = io::stdout().lock();
     loop {
         match device.fetch_events() {
             Ok(batch) => {
@@ -120,8 +174,13 @@ fn cmd_listen(needle: &str) -> io::Result<()> {
                     if e.event_type() == EventType::SYNCHRONIZATION {
                         continue;
                     }
-                    println!("{} {} {}", e.event_type().0, e.code(), e.value());
+                    if with_ts {
+                        writeln!(out, "R {} {} {} {}", now_ns(), e.event_type().0, e.code(), e.value())?;
+                    } else {
+                        writeln!(out, "{} {} {}", e.event_type().0, e.code(), e.value())?;
+                    }
                 }
+                out.flush()?;
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(5));
@@ -142,9 +201,31 @@ fn main() -> io::Result<()> {
             let delay: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
             cmd_emit_hold(delay)
         }
-        Some("listen") => cmd_listen(args.get(2).map(|s| s.as_str()).unwrap_or("")),
+        Some("emit-bench") => {
+            let delay: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
+            let count: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200);
+            let interval: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10);
+            let mouse = args.get(5).map(|s| s == "mouse").unwrap_or(false);
+            cmd_emit_bench(delay, count, interval, mouse)
+        }
+        Some("listen") => {
+            let positional: Vec<&str> = args
+                .iter()
+                .skip(2)
+                .filter(|a| !a.starts_with('-'))
+                .map(|s| s.as_str())
+                .collect();
+            cmd_listen(
+                positional.first().copied().unwrap_or(""),
+                args.iter().any(|a| a == "--ts"),
+            )
+        }
         _ => {
-            eprintln!("usage: e2e emit [delay_secs] | e2e listen <name-substring>");
+            eprintln!(
+                "usage: e2e emit [delay_secs] | emit-hold [delay_secs] | \
+                 emit-bench [delay_s count interval_ms key|mouse] | \
+                 listen <name-substring> [--ts]"
+            );
             std::process::exit(2);
         }
     }

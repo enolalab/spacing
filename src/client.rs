@@ -42,49 +42,42 @@ pub async fn run(dir: PathBuf, to: Option<String>, cfg_path: Option<PathBuf>) ->
     let mut last_rx = Instant::now();
     let mut released = true;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
+    // Cancellation-safe read buffer: `read_buf` appends into `netbuf`, so
+    // bytes already received survive a `select!` cancellation — a
+    // `recv_msg` future here would lose partially-read bytes and desync
+    // the frame stream (observed as intermittent "frame too large").
+    let mut netbuf: Vec<u8> = Vec::with_capacity(16 * 1024);
 
     loop {
         tokio::select! {
-            m = spacing_net::conn::recv_msg(&mut rd) => {
-                match m {
-                    Ok(Message::Input(ev)) => {
-                        match inject.inject(&ev) {
-                            Ok(()) => {
-                                last_rx = Instant::now();
-                                released = false;
-                            }
-                            Err(e) => {
-                                // spec §5: client báo Error → server về Local;
-                                // release phím đang giữ trước khi chết.
-                                let _ = spacing_net::conn::send_msg(&mut wr, &Message::Error {
-                                    code: 1,
-                                    message: e.to_string(),
-                                })
-                                .await;
-                                let _ = inject.release_all();
-                                anyhow::bail!("inject failed: {e}");
+            r = tokio::io::AsyncReadExt::read_buf(&mut rd, &mut netbuf) => {
+                match r {
+                    Ok(0) => {
+                        tracing::error!("connection lost: server closed");
+                        inject.release_all()?;
+                        anyhow::bail!("connection lost: server closed");
+                    }
+                    Ok(_) => {
+                        loop {
+                            match spacing_net::conn::try_decode(&mut netbuf) {
+                                Ok(Some(m)) => {
+                                    match handle_msg(&m, &mut inject, &mut wr, &mut last_rx, &mut released).await {
+                                        Ok(()) => {}
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    tracing::error!("connection lost: {e}");
+                                    let _ = inject.release_all();
+                                    anyhow::bail!("connection lost: {e}");
+                                }
                             }
                         }
                     }
-                    Ok(Message::Heartbeat) => {
-                        last_rx = Instant::now();
-                    }
-                    Ok(Message::ReleaseControl) => {
-                        inject.release_all()?;
-                        last_rx = Instant::now();
-                        released = true;
-                    }
-                    Ok(Message::HelloAck { .. }) => {
-                        last_rx = Instant::now();
-                    }
-                    Ok(Message::PairAccept | Message::PairReject) => {}
-                    Ok(Message::Error { message, .. }) => {
-                        tracing::warn!("server error: {message}")
-                    }
-                    Ok(_) => {}
                     Err(e) => {
                         tracing::error!("connection lost: {e}");
-                        inject.release_all()?;
+                        let _ = inject.release_all();
                         anyhow::bail!("connection lost: {e}");
                     }
                 }
@@ -100,4 +93,46 @@ pub async fn run(dir: PathBuf, to: Option<String>, cfg_path: Option<PathBuf>) ->
             }
         }
     }
+}
+
+async fn handle_msg(
+    m: &Message,
+    inject: &mut UinputInject,
+    wr: &mut spacing_net::Wr,
+    last_rx: &mut Instant,
+    released: &mut bool,
+) -> anyhow::Result<()> {
+    match m {
+        Message::Input(ev) => match inject.inject(ev) {
+            Ok(()) => {
+                *last_rx = Instant::now();
+                *released = false;
+            }
+            Err(e) => {
+                // spec §5: client báo Error → server về Local;
+                // release phím đang giữ trước khi chết.
+                let _ = spacing_net::conn::send_msg(wr, &Message::Error {
+                    code: 1,
+                    message: e.to_string(),
+                })
+                .await;
+                let _ = inject.release_all();
+                anyhow::bail!("inject failed: {e}");
+            }
+        },
+        Message::Heartbeat | Message::HelloAck { .. } => {
+            *last_rx = Instant::now();
+        }
+        Message::ReleaseControl => {
+            inject.release_all()?;
+            *last_rx = Instant::now();
+            *released = true;
+        }
+        Message::PairAccept | Message::PairReject => {}
+        Message::Error { message, .. } => {
+            tracing::warn!("server error: {message}")
+        }
+        _ => {}
+    }
+    Ok(())
 }

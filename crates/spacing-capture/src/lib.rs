@@ -18,6 +18,12 @@ impl EvdevCapture {
     pub fn enumerate() -> io::Result<Self> {
         let mut streams = Vec::new();
         for (path, device) in evdev::enumerate() {
+            // Never capture our own injected device — on a machine running
+            // both modes it would feed injected events back into the wire
+            // (infinite echo loop).
+            if device.name() == Some("spacing-virtual-input") {
+                continue;
+            }
             let is_kb = device
                 .supported_keys()
                 .map(|k| {
