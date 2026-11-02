@@ -1,8 +1,11 @@
 pub mod clipdedup;
 pub mod combo;
 pub mod config;
+pub mod edge;
 pub mod event;
 pub mod hidmap;
+pub mod keymap_mac;
+pub mod keymap_win;
 pub mod peers;
 pub mod protocol;
 pub mod router;

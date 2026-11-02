@@ -1,12 +1,22 @@
 pub mod clipboard;
+#[cfg(target_os = "linux")]
 pub mod map;
+#[cfg(target_os = "linux")]
 pub mod portal;
+#[cfg(windows)]
+pub mod windows;
+#[cfg(target_os = "macos")]
+pub mod macos;
 
+#[cfg(target_os = "linux")]
 use evdev::uinput::VirtualDeviceBuilder;
+#[cfg(target_os = "linux")]
 use evdev::{AttributeSet, Key, RelativeAxisType};
 use spacing_core::config::Backend;
 use spacing_core::event::InputEvent;
+#[cfg(target_os = "linux")]
 use spacing_core::hidmap::{hid_to_evdev, EV_TO_HID};
+#[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::io;
 
@@ -21,8 +31,10 @@ pub trait InjectionBackend: Send {
     async fn release_all(&mut self) -> io::Result<()>;
 }
 
-/// Pick an injection backend. `Auto`: RemoteDesktop portal on Wayland
-/// when available, else uinput (kernel-level, works everywhere).
+/// Pick an injection backend. Linux `Auto`: RemoteDesktop portal on
+/// Wayland when available, else uinput. Windows/macOS always use the
+/// native backend (`SendInput` / `CGEventPost`).
+#[cfg(target_os = "linux")]
 pub async fn select_inject(backend: Backend) -> io::Result<Box<dyn InjectionBackend>> {
     match backend {
         Backend::Evdev => UinputInject::create().map(|i| Box::new(i) as _),
@@ -46,6 +58,25 @@ pub async fn select_inject(backend: Backend) -> io::Result<Box<dyn InjectionBack
     }
 }
 
+#[cfg(windows)]
+pub async fn select_inject(_backend: Backend) -> io::Result<Box<dyn InjectionBackend>> {
+    windows::SendInputInject::create().map(|i| Box::new(i) as _)
+}
+
+#[cfg(target_os = "macos")]
+pub async fn select_inject(_backend: Backend) -> io::Result<Box<dyn InjectionBackend>> {
+    macos::CgInject::create().map(|i| Box::new(i) as _)
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+pub async fn select_inject(_backend: Backend) -> io::Result<Box<dyn InjectionBackend>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no injection backend for this platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn wayland_session() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some()
         && std::env::var("XDG_SESSION_TYPE").map_or(true, |v| v == "wayland")
@@ -54,11 +85,13 @@ fn wayland_session() -> bool {
 /// Virtual keyboard+mouse created via /dev/uinput.
 /// Works under Wayland and X11 (kernel-level). Requires write access to
 /// /dev/uinput (see README udev rule).
+#[cfg(target_os = "linux")]
 pub struct UinputInject {
     dev: evdev::uinput::VirtualDevice,
     held: HashSet<u16>, // evdev codes currently down (keys AND BTN_* buttons)
 }
 
+#[cfg(target_os = "linux")]
 impl UinputInject {
     pub fn create() -> io::Result<Self> {
         let mut keys = AttributeSet::<Key>::new();
@@ -129,6 +162,7 @@ impl UinputInject {
 
 }
 
+#[cfg(target_os = "linux")]
 #[async_trait::async_trait]
 impl InjectionBackend for UinputInject {
     async fn inject(&mut self, ev: &InputEvent) -> io::Result<()> {
@@ -140,7 +174,7 @@ impl InjectionBackend for UinputInject {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod select_tests {
     use super::*;
 

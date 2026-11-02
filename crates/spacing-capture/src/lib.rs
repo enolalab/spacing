@@ -1,12 +1,21 @@
+#[cfg(target_os = "linux")]
 pub mod map;
+#[cfg(target_os = "linux")]
 pub mod portal;
+#[cfg(windows)]
+pub mod windows;
+#[cfg(target_os = "macos")]
+pub mod macos;
 
+#[cfg(target_os = "linux")]
 use futures::stream;
+#[cfg(target_os = "linux")]
 use futures::StreamExt as _;
 use spacing_core::config::Backend;
 use spacing_core::event::InputEvent;
 use std::collections::BTreeMap;
 use std::io;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 
 /// Event from a capture backend. The evdev backend only yields `Input`;
@@ -38,8 +47,11 @@ pub trait CaptureBackend: Send {
 /// Screen-edge → client map for portal barrier switching.
 pub type EdgeMap = BTreeMap<String, String>;
 
-/// Pick a capture backend. `Auto`: Wayland portal when the session can
-/// provide it, else evdev (kernel-level, works everywhere).
+/// Pick a capture backend.
+/// Linux `Auto`: Wayland portal when the session can provide it, else
+/// evdev. Windows/macOS always use the native backend regardless of
+/// `backend` (the names are Linux-specific).
+#[cfg(target_os = "linux")]
 pub async fn select_capture(
     backend: Backend,
     edges: &EdgeMap,
@@ -66,6 +78,34 @@ pub async fn select_capture(
     }
 }
 
+#[cfg(windows)]
+pub async fn select_capture(
+    _backend: Backend,
+    edges: &EdgeMap,
+) -> io::Result<Box<dyn CaptureBackend>> {
+    windows::WinHooksCapture::connect(edges).map(|c| Box::new(c) as _)
+}
+
+#[cfg(target_os = "macos")]
+pub async fn select_capture(
+    _backend: Backend,
+    edges: &EdgeMap,
+) -> io::Result<Box<dyn CaptureBackend>> {
+    macos::CgTapCapture::connect(edges).map(|c| Box::new(c) as _)
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+pub async fn select_capture(
+    _backend: Backend,
+    _edges: &EdgeMap,
+) -> io::Result<Box<dyn CaptureBackend>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no capture backend for this platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn wayland_session() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some()
         && std::env::var("XDG_SESSION_TYPE").map_or(true, |v| v == "wayland")
@@ -73,10 +113,12 @@ fn wayland_session() -> bool {
 
 /// Owns all physical input devices as event streams.
 /// grab() = EVIOCGRAB trên từng fd (OS ngừng nhận input); stream vẫn đọc được.
+#[cfg(target_os = "linux")]
 pub struct EvdevCapture {
     streams: Vec<evdev::EventStream>,
 }
 
+#[cfg(target_os = "linux")]
 impl EvdevCapture {
     /// Scan /dev/input, keep devices that look like keyboards or mice,
     /// convert each to an EventStream. Requires read access to
@@ -170,6 +212,7 @@ impl EvdevCapture {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[async_trait::async_trait]
 impl CaptureBackend for EvdevCapture {
     async fn grab(&mut self) -> io::Result<()> {
@@ -185,7 +228,7 @@ impl CaptureBackend for EvdevCapture {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use spacing_core::config::Backend;

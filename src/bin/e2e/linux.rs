@@ -303,7 +303,7 @@ fn cmd_listen(needle: &str, with_ts: bool) -> io::Result<()> {
     }
 }
 
-fn main() -> io::Result<()> {
+pub fn run() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("emit") => {

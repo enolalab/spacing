@@ -19,21 +19,29 @@ Ctrl+Alt+0 → your input comes back local
 |---|---|---|---|
 | Linux (X11 / Wayland / TTY) | evdev | uinput | **supported** |
 | Linux Wayland (portal-native) | InputCapture portal → libei | RemoteDesktop portal → libei | **supported** (GNOME 45+/KDE 6.1+) |
-| Windows | low-level hooks | SendInput | planned |
-| macOS | CGEventTap | CGEvent | planned |
+| Windows | `WH_KEYBOARD_LL`/`WH_MOUSE_LL` hooks | `SendInput` (scan codes) | implemented — compiles, needs on-device smoke test |
+| macOS | `CGEventTap` | `CGEventPost` | implemented — compiles, needs on-device smoke test |
 
-Two backends on Linux, chosen by `backend = "auto"`:
+Backends per platform:
 
-- **`evdev`** — kernel-level, works on X11, Wayland, and headless/TTY;
-  needs `/dev/input` + `/dev/uinput` access. Switch by hotkey.
-- **`portal`** — XDG InputCapture + RemoteDesktop portals over libei;
-  no udev rules needed, native Wayland. Switch by moving the pointer
-  across a configured screen edge (or `Ctrl+Alt+0` back).
+- **`evdev`** (Linux) — kernel-level, works on X11, Wayland, and
+  headless/TTY; needs `/dev/input` + `/dev/uinput` access. Switch by hotkey.
+- **`portal`** (Linux) — XDG InputCapture + RemoteDesktop portals over
+  libei; no udev rules needed, native Wayland. Switch by moving the
+  pointer across a configured screen edge (or `Ctrl+Alt+0` back).
+- **Windows hooks** — low-level keyboard/mouse hooks on a dedicated
+  message-pump thread swallow events while remote and mirror them for
+  edge/hotkey switching while local. Edge switching uses the
+  clamped-cursor technique (consecutive outward pushes at the screen
+  edge), matching Barrier/Deskflow UX.
+- **macOS CGEventTap** — a session event tap on its own CFRunLoop
+  thread; same edge-switch semantics as Windows.
 
 ## Features
 
-- **Screen-edge switching** (portal backend) — push the pointer through a
-  configured monitor edge to hand control to the mapped machine
+- **Screen-edge switching** — push the pointer through a configured
+  monitor edge to hand control to the mapped machine (portal barriers on
+  Wayland, clamped-cursor detection on Windows/macOS)
 - **Hotkey switching** between the input-owner machine and any paired client
 - **Text clipboard sync** — copies follow your input, up to 1 MiB, both ways
 - **Mutual TLS 1.3** — every keystroke encrypted on the wire
@@ -75,6 +83,18 @@ Portable static build (any Linux): `./contrib/build-static.sh` →
 `target/x86_64-unknown-linux-gnu/release/spacing`.
 
 ### Permissions (required, both machines)
+
+**Windows:** none for a regular desktop session — `WH_*_LL` hooks and
+`SendInput` are user-level APIs. Note: input from/to *elevated* apps is
+ignored unless spacing itself runs elevated (UIPI).
+
+**macOS:** two TCC grants in *System Settings → Privacy & Security*:
+- **Input Monitoring** — required for the `CGEventTap` capture
+  (server side). spacing fails to start with a hint if missing.
+- **Accessibility** — required for `CGEventPost` injection
+  (client side).
+Grant to the terminal app (or the installed `spacing` binary), then
+restart spacing once.
 
 **Portal backend (Wayland, GNOME 45+/KDE 6.1+):** nothing — the portal
 mediates device access. GNOME shows a permission dialog per start
@@ -202,8 +222,11 @@ Measured on two Ubuntu 24.04 VMs (full methodology and raw data in the
 
 - ~~**P2** — Wayland-native path: XDG InputCapture portal + libei inject,
   edge/barrier switching, text clipboard (≤1 MiB)~~ **done**
-- **P3** — Windows backend (hooks + SendInput)
-- **P4** — macOS backend (CGEventTap)
+- ~~**P3** — Windows backend (`WH_*_LL` hooks + `SendInput` scan codes,
+  clamped-cursor edge switching)~~ — implemented, pending device testing
+- ~~**P4** — macOS backend (`CGEventTap` + `CGEventPost`,
+  Input Monitoring/Accessibility permissions)~~ — implemented, pending
+  device testing
 - **P5** — edge-switch for evdev path, auto-reconnect, mDNS discovery,
   systemd units, hotplug support, RemoteDesktop restore tokens
 
