@@ -9,6 +9,17 @@ pub enum Mode {
     Client,
 }
 
+/// Input backend selection. `auto` picks the portal backend on Wayland
+/// when the desktop supports it, otherwise evdev/uinput.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    #[default]
+    Auto,
+    Evdev,
+    Portal,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub mode: Mode,
@@ -16,6 +27,8 @@ pub struct Config {
     pub bind: String,
     /// Client mode only.
     pub connect_to: Option<String>,
+    #[serde(default)]
+    pub backend: Backend,
     #[serde(default)]
     pub server: ServerCfg,
 }
@@ -68,8 +81,24 @@ mod tests {
         let c = load_config(&p).unwrap();
         assert_eq!(c.mode, Mode::Server);
         assert_eq!(c.bind, "0.0.0.0:24800");
+        assert_eq!(c.backend, Backend::Auto);
         assert_eq!(c.server.hotkeys.local.as_deref(), Some("Ctrl+Alt+0"));
         assert_eq!(c.server.hotkeys.switch["Ctrl+Alt+1"], "laptop");
         assert_eq!(c.server.hotkeys.switch["Ctrl+Alt+2"], "desktop");
+    }
+
+    #[test]
+    fn parses_backend_selection() {
+        for (raw, want) in [
+            ("evdev", Backend::Evdev),
+            ("portal", Backend::Portal),
+            ("auto", Backend::Auto),
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                "mode = \"server\"\nbackend = \"{raw}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(cfg.backend, want, "{raw}");
+        }
     }
 }

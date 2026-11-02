@@ -1,5 +1,5 @@
 use anyhow::Context;
-use spacing_capture::EvdevCapture;
+use spacing_capture::{select_capture, CaptureBackend, CaptureEvent};
 use spacing_core::combo::parse_combo;
 use spacing_core::config::{load_config, Mode};
 use spacing_core::peers::PeerStore;
@@ -64,8 +64,8 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
     }
     let mut router = Router::new(local, switch);
 
-    let mut cap = EvdevCapture::enumerate().context(
-        "cannot capture /dev/input — add user to 'input' group or apply the udev rule in README",
+    let mut cap = select_capture(cfg.backend).context(
+        "cannot initialize input capture — check backend config, input group, or the udev rule in README",
     )?;
 
     let listener = TcpListener::bind(&cfg.bind).await?;
@@ -117,12 +117,24 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
                 let prev = router.target().clone();
                 conns.remove(&dead);
                 if matches!(&prev, Target::Remote(n) if n == &dead) {
-                    to_local(&mut cap, &mut router, &conns, &prev).await;
+                    to_local(&mut *cap, &mut router, &conns, &prev).await;
                 }
             }
             // cap.next_event() borrows `cap` only while pending — arms can
             // grab()/ungrab() freely after it resolves.
-            Some(ev) = cap.next_event() => {
+            Some(cev) = cap.next_event() => {
+                let ev = match cev {
+                    CaptureEvent::Input(ev) => ev,
+                    // Portal edge events — wired to the router in T6.
+                    CaptureEvent::Activated { ref zone } => {
+                        tracing::info!(%zone, "capture barrier activated");
+                        continue;
+                    }
+                    CaptureEvent::Deactivated => {
+                        tracing::info!("capture deactivated");
+                        continue;
+                    }
+                };
                 let prev = router.target().clone();
                 match router.on_event(ev) {
                     Decision::Drop => {}
@@ -130,7 +142,7 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
                         if let Target::Remote(name) = router.target() {
                             if let Some(tx) = conns.get(name) {
                                 if tx.send_timeout(Message::Input(e), SEND_TIMEOUT).await.is_err() {
-                                    fail_to_local(&mut cap, &mut router);
+                                    fail_to_local(&mut *cap, &mut router).await;
                                 }
                             }
                         }
@@ -153,7 +165,7 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
                                     }
                                 }
                             }
-                            if let Err(e) = cap.grab() {
+                            if let Err(e) = cap.grab().await {
                                 tracing::error!("grab failed: {e} — staying local");
                                 router.on_disconnected();
                             }
@@ -161,7 +173,7 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
                     }
                     Decision::SwitchToLocal => {
                         tracing::info!("back to local");
-                        to_local(&mut cap, &mut router, &conns, &prev).await;
+                        to_local(&mut *cap, &mut router, &conns, &prev).await;
                     }
                 }
             }
@@ -169,7 +181,7 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
                 if let Target::Remote(name) = router.target() {
                     if let Some(tx) = conns.get(name) {
                         if tx.send_timeout(Message::Heartbeat, SEND_TIMEOUT).await.is_err() {
-                            fail_to_local(&mut cap, &mut router);
+                            fail_to_local(&mut *cap, &mut router).await;
                         }
                     }
                 }
@@ -181,7 +193,7 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
 /// Spec order: ReleaseControl → (client release_all) → ungrab → Local.
 /// `prev` is the target we just left — only it needs ReleaseControl.
 async fn to_local(
-    cap: &mut EvdevCapture,
+    cap: &mut dyn CaptureBackend,
     router: &mut Router,
     conns: &HashMap<String, mpsc::Sender<Message>>,
     prev: &Target,
@@ -192,11 +204,11 @@ async fn to_local(
             let _ = tx.send_timeout(Message::ReleaseControl, SEND_TIMEOUT).await;
         }
     }
-    let _ = cap.ungrab();
+    let _ = cap.ungrab().await;
 }
 
-fn fail_to_local(cap: &mut EvdevCapture, router: &mut Router) {
+async fn fail_to_local(cap: &mut dyn CaptureBackend, router: &mut Router) {
     tracing::warn!("send failed — returning to local");
     router.on_disconnected();
-    let _ = cap.ungrab();
+    let _ = cap.ungrab().await;
 }

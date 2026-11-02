@@ -2,10 +2,33 @@ pub mod map;
 
 use evdev::uinput::VirtualDeviceBuilder;
 use evdev::{AttributeSet, Key, RelativeAxisType};
+use spacing_core::config::Backend;
 use spacing_core::event::InputEvent;
 use spacing_core::hidmap::{hid_to_evdev, EV_TO_HID};
 use std::collections::HashSet;
 use std::io;
+
+/// Pluggable injection backend (spec §Traits): uinput today, the
+/// RemoteDesktop portal (libei) on capable Wayland desktops.
+#[async_trait::async_trait]
+pub trait InjectionBackend: Send {
+    async fn inject(&mut self, ev: &InputEvent) -> io::Result<()>;
+    /// Key-up everything currently held — disconnect/watchdog path.
+    async fn release_all(&mut self) -> io::Result<()>;
+    async fn set_clipboard(&mut self, text: &str) -> io::Result<()>;
+}
+
+/// Pick an injection backend. `Auto`: portal when implemented and the
+/// session supports it, else uinput.
+pub fn select_inject(backend: Backend) -> io::Result<Box<dyn InjectionBackend>> {
+    match backend {
+        Backend::Evdev | Backend::Auto => UinputInject::create().map(|i| Box::new(i) as _),
+        Backend::Portal => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "portal backend not built yet — use backend = \"evdev\" or \"auto\"",
+        )),
+    }
+}
 
 /// Virtual keyboard+mouse created via /dev/uinput.
 /// Works under Wayland and X11 (kernel-level). Requires write access to
@@ -89,5 +112,31 @@ impl UinputInject {
             io::ErrorKind::Unsupported,
             "clipboard not in P1",
         ))
+    }
+}
+
+#[async_trait::async_trait]
+impl InjectionBackend for UinputInject {
+    async fn inject(&mut self, ev: &InputEvent) -> io::Result<()> {
+        UinputInject::inject(self, ev)
+    }
+
+    async fn release_all(&mut self) -> io::Result<()> {
+        UinputInject::release_all(self)
+    }
+
+    async fn set_clipboard(&mut self, text: &str) -> io::Result<()> {
+        UinputInject::set_clipboard(self, text).await
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_portal_backend_errors_until_built() {
+        let e = select_inject(Backend::Portal).err().unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
     }
 }

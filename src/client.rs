@@ -2,7 +2,7 @@ use anyhow::Context;
 use spacing_core::config::{load_config, Mode};
 use spacing_core::peers::PeerStore;
 use spacing_core::protocol::{Message, PROTOCOL_VERSION};
-use spacing_inject::UinputInject;
+use spacing_inject::{select_inject, InjectionBackend};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -37,8 +37,9 @@ pub async fn run(dir: PathBuf, to: Option<String>, cfg_path: Option<PathBuf>) ->
     )
     .await?;
 
-    let mut inject = UinputInject::create()
-        .context("cannot open /dev/uinput — modprobe uinput + apply udev rule in README")?;
+    let backend = cfg.map(|c| c.backend).unwrap_or_default();
+    let mut inject = select_inject(backend)
+        .context("cannot initialize input injection — check backend config or the udev rule in README")?;
     let mut last_rx = Instant::now();
     let mut released = true;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -54,14 +55,14 @@ pub async fn run(dir: PathBuf, to: Option<String>, cfg_path: Option<PathBuf>) ->
                 match r {
                     Ok(0) => {
                         tracing::error!("connection lost: server closed");
-                        inject.release_all()?;
+                        inject.release_all().await?;
                         anyhow::bail!("connection lost: server closed");
                     }
                     Ok(_) => {
                         loop {
                             match spacing_net::conn::try_decode(&mut netbuf) {
                                 Ok(Some(m)) => {
-                                    match handle_msg(&m, &mut inject, &mut wr, &mut last_rx, &mut released).await {
+                                    match handle_msg(&m, &mut *inject, &mut wr, &mut last_rx, &mut released).await {
                                         Ok(()) => {}
                                         Err(e) => return Err(e),
                                     }
@@ -69,7 +70,7 @@ pub async fn run(dir: PathBuf, to: Option<String>, cfg_path: Option<PathBuf>) ->
                                 Ok(None) => break,
                                 Err(e) => {
                                     tracing::error!("connection lost: {e}");
-                                    let _ = inject.release_all();
+                                    let _ = inject.release_all().await;
                                     anyhow::bail!("connection lost: {e}");
                                 }
                             }
@@ -77,7 +78,7 @@ pub async fn run(dir: PathBuf, to: Option<String>, cfg_path: Option<PathBuf>) ->
                     }
                     Err(e) => {
                         tracing::error!("connection lost: {e}");
-                        let _ = inject.release_all();
+                        let _ = inject.release_all().await;
                         anyhow::bail!("connection lost: {e}");
                     }
                 }
@@ -87,7 +88,7 @@ pub async fn run(dir: PathBuf, to: Option<String>, cfg_path: Option<PathBuf>) ->
                     tracing::warn!(
                         "watchdog: no input/heartbeat for {WATCHDOG_MS}ms — releasing keys"
                     );
-                    inject.release_all()?;
+                    inject.release_all().await?;
                     released = true;
                 }
             }
@@ -97,13 +98,13 @@ pub async fn run(dir: PathBuf, to: Option<String>, cfg_path: Option<PathBuf>) ->
 
 async fn handle_msg(
     m: &Message,
-    inject: &mut UinputInject,
+    inject: &mut dyn InjectionBackend,
     wr: &mut spacing_net::Wr,
     last_rx: &mut Instant,
     released: &mut bool,
 ) -> anyhow::Result<()> {
     match m {
-        Message::Input(ev) => match inject.inject(ev) {
+        Message::Input(ev) => match inject.inject(ev).await {
             Ok(()) => {
                 *last_rx = Instant::now();
                 *released = false;
@@ -116,7 +117,7 @@ async fn handle_msg(
                     message: e.to_string(),
                 })
                 .await;
-                let _ = inject.release_all();
+                let _ = inject.release_all().await;
                 anyhow::bail!("inject failed: {e}");
             }
         },
@@ -124,7 +125,7 @@ async fn handle_msg(
             *last_rx = Instant::now();
         }
         Message::ReleaseControl => {
-            inject.release_all()?;
+            inject.release_all().await?;
             *last_rx = Instant::now();
             *released = true;
         }

@@ -8,3 +8,4 @@ license.workspace = true
 spacing-core = { path = "../spacing-core" }
 evdev = "0.12"
 tracing = "0.1"
+async-trait = "0.1"
