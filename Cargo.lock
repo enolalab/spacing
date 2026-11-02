@@ -915,10 +915,13 @@ version = "0.1.0"
 name = "spacing-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "postcard",
  "proptest",
  "serde",
+ "tempfile",
  "thiserror 2.0.21",
+ "toml",
 ]
 
 [[package]]

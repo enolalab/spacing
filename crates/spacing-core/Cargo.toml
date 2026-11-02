@@ -8,6 +8,9 @@ license.workspace = true
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 thiserror = "2"
+toml = "0.8"
+anyhow = "1"
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
