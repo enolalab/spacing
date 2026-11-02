@@ -45,11 +45,14 @@ client của máy khác (cần inject).
 
 ```rust
 trait CaptureBackend {
-    async fn grab(&mut self) -> Result<()>;       // chiếm input vật lý
-    async fn ungrab(&mut self) -> Result<()>;
-    fn events(&self) -> impl Stream<Item = InputEvent>;   // chỉ emit khi grabbed
-    async fn poll_hotkeys(&self) -> Option<Hotkey>;       // check trước khi forward
+    async fn grab(&mut self) -> Result<()>;     // OS ngừng nhận input vật lý
+    async fn ungrab(&mut self) -> Result<()>;   // OS nhận lại
+    fn events(&self) -> impl Stream<Item = InputEvent>;  // luôn emit, kể cả khi ungrabbed
 }
+
+// evdev đọc được event mà không cần grab → server luôn lắng nghe;
+// router check từng event với hotkey map TRƯỚC khi forward,
+// grab/ungrab chỉ bật/tắt việc OS nhận input.
 
 trait InjectionBackend {
     async fn inject(&mut self, ev: &InputEvent) -> Result<()>;
@@ -76,7 +79,9 @@ ClientHello { protocol_version, hostname }
 ServerHello { protocol_version }
 PairRequest / PairAccept { fingerprint } / PairReject
 InputEvent = KeyDown(HidCode) | KeyUp(HidCode)
-           | MouseMoveRel { dx, dy } | MouseMoveAbs { x, y }   // abs: P2 portal
+           | MouseMoveRel { dx, dy } | MouseMoveAbs { x, y }   // abs: P2 portal,
+           // toạ độ trong không gian màn hình của client, chỉ gửi khi
+           // InjectionBackend báo hỗ trợ absolute positioning
            | ButtonDown(Btn) | ButtonUp(Btn) | Wheel { dx, dy }
 ClipboardSet { text }          // cap 1MB, utf-8
 ReleaseControl                 // server thông báo trả quyền về local
@@ -88,14 +93,15 @@ Error { code, message }
 
 ### Server
 
-1. State `Local` (mặc định): input vào OS bình thường, backend không grab.
-   Chỉ có hotkey listener chạy.
+1. State `Local` (mặc định): backend đọc event nhưng không grab → input
+   vào OS bình thường; router chỉ theo dõi stream để bắt hotkey.
 2. Hotkey `Ctrl+Alt+N` (hoặc barrier crossing — P2) → router set
    `ActiveTarget::Remote(id)` → `grab()` → mọi `InputEvent` serialize →
    TLS → client tương ứng.
-3. Quay về (hotkey local / barrier ngược): gửi `ReleaseControl` + flush
-   mọi phím đang down (key-up) → `ungrab()` → state `Local`. Cursor trả
-   về mép do compositor lo (portal) hoặc vị trí ảo clamped (evdev, P5).
+3. Quay về (hotkey local / barrier ngược): gửi `ReleaseControl` → client
+   nhận và `release_all()` (key-up mọi phím đang down) → server `ungrab()`
+   → state `Local`. Cursor trả về mép do compositor lo (portal) hoặc vị
+   trí ảo clamped (evdev, P5).
 4. Hotkey check TRƯỚC khi forward event → `Ctrl+Alt+0` (về local) luôn
    thoát được kể cả khi đang remote.
 
