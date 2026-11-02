@@ -1,9 +1,10 @@
 use anyhow::Context;
 use spacing_capture::{select_capture, CaptureBackend, CaptureEvent};
+use spacing_core::clipdedup::ClipDedup;
 use spacing_core::combo::parse_combo;
 use spacing_core::config::{load_config, Mode};
 use spacing_core::peers::PeerStore;
-use spacing_core::protocol::Message;
+use spacing_core::protocol::{Message, CLIPBOARD_MAX};
 use spacing_core::router::{Decision, Router, Target};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,6 +16,13 @@ use tokio::sync::mpsc;
 
 const SEND_TIMEOUT: Duration = Duration::from_millis(20);
 const HEARTBEAT_MS: u64 = 250;
+const CLIPBOARD_POLL_MS: u64 = 300;
+
+/// Reader tasks report client deaths AND inbound clipboard updates.
+enum Ctrl {
+    Dead(String),
+    Clip(String),
+}
 
 async fn writer_task(mut wr: spacing_net::Wr, mut rx: mpsc::Receiver<Message>) {
     while let Some(m) = rx.recv().await {
@@ -25,17 +33,24 @@ async fn writer_task(mut wr: spacing_net::Wr, mut rx: mpsc::Receiver<Message>) {
 }
 
 /// Reads client->server control messages; reports peer_name on EOF/Error.
-async fn reader_task(mut rd: spacing_net::Rd, name: String, ctrl: mpsc::Sender<String>) {
+async fn reader_task(mut rd: spacing_net::Rd, name: String, ctrl: mpsc::Sender<Ctrl>) {
     loop {
         match spacing_net::conn::recv_msg(&mut rd).await {
             Ok(Message::Error { message, .. }) => {
                 tracing::warn!(peer = %name, "client error: {message}");
-                let _ = ctrl.send(name).await;
+                let _ = ctrl.send(Ctrl::Dead(name)).await;
                 return;
+            }
+            Ok(Message::ClipboardSet { text }) => {
+                if text.len() <= CLIPBOARD_MAX {
+                    let _ = ctrl.send(Ctrl::Clip(text)).await;
+                } else {
+                    tracing::warn!(peer = %name, "clipboard >1MiB — dropped");
+                }
             }
             Ok(_) => {}
             Err(_) => {
-                let _ = ctrl.send(name).await;
+                let _ = ctrl.send(Ctrl::Dead(name)).await;
                 return;
             }
         }
@@ -77,9 +92,14 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
     // accepted conns arrive here from accept tasks
     let (new_tx, mut new_rx) = mpsc::channel::<spacing_net::ServerConn>(8);
     // dead/errored peer_names arrive here from reader tasks
-    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<String>(8);
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Ctrl>(8);
     let mut hb = tokio::time::interval(Duration::from_millis(HEARTBEAT_MS));
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // latest-wins text clipboard with echo suppression
+    let mut clip = spacing_inject::clipboard::select_clipboard();
+    let mut clip_dedup = ClipDedup::default();
+    let mut clip_tick = tokio::time::interval(Duration::from_millis(CLIPBOARD_POLL_MS));
+    clip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -112,14 +132,22 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
                 tokio::spawn(writer_task(conn.wr, rx));
                 tokio::spawn(reader_task(conn.rd, name, ctrl_tx.clone()));
             }
-            Some(dead) = ctrl_rx.recv() => {
-                tracing::warn!(peer = %dead, "client lost");
-                let prev = router.target().clone();
-                conns.remove(&dead);
-                if matches!(&prev, Target::Remote(n) if n == &dead) {
-                    to_local(&mut *cap, &mut router, &conns, &prev).await;
+            Some(ctrl) = ctrl_rx.recv() => match ctrl {
+                Ctrl::Dead(dead) => {
+                    tracing::warn!(peer = %dead, "client lost");
+                    let prev = router.target().clone();
+                    conns.remove(&dead);
+                    if matches!(&prev, Target::Remote(n) if n == &dead) {
+                        to_local(&mut *cap, &mut router, &conns, &prev).await;
+                    }
                 }
-            }
+                Ctrl::Clip(text) => {
+                    clip_dedup.applied_remote(&text);
+                    if let Err(e) = clip.set_text(&text) {
+                        tracing::warn!("clipboard set failed: {e}");
+                    }
+                }
+            },
             // cap.next_event() borrows `cap` only while pending — arms can
             // grab()/ungrab() freely after it resolves.
             Some(cev) = cap.next_event() => {
@@ -168,6 +196,21 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
                             if let Err(e) = cap.grab().await {
                                 tracing::error!("grab failed: {e} — staying local");
                                 router.on_disconnected();
+                            } else {
+                                // spec: push local clipboard on switch
+                                if let Ok(cur) = clip.get_text() {
+                                    let _ = clip_dedup.poll(cur.as_deref()); // mark seen
+                                    if let Some(text) = cur.filter(|t| t.len() <= CLIPBOARD_MAX) {
+                                        if let Some(tx) = conns.get(&name) {
+                                            let _ = tx
+                                                .send_timeout(
+                                                    Message::ClipboardSet { text },
+                                                    SEND_TIMEOUT,
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -183,6 +226,25 @@ pub async fn run(dir: PathBuf, cfg_path: Option<PathBuf>, pairing: bool) -> anyh
                         if tx.send_timeout(Message::Heartbeat, SEND_TIMEOUT).await.is_err() {
                             fail_to_local(&mut *cap, &mut router).await;
                         }
+                    }
+                }
+            }
+            // watch local clipboard only while remote — on-switch push
+            // covers copies made while local.
+            _ = clip_tick.tick(), if matches!(router.target(), Target::Remote(_)) => {
+                let cur = clip.get_text().unwrap_or_default();
+                if let Some(text) = clip_dedup.poll(cur.as_deref()) {
+                    if text.len() <= CLIPBOARD_MAX {
+                        if let Target::Remote(name) = router.target() {
+                            if let Some(tx) = conns.get(name) {
+                                // dropped clipboard is not a session failure
+                                let _ = tx
+                                    .send_timeout(Message::ClipboardSet { text }, SEND_TIMEOUT)
+                                    .await;
+                            }
+                        }
+                    } else {
+                        tracing::warn!("clipboard >1MiB — not forwarded");
                     }
                 }
             }

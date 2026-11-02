@@ -1,3 +1,4 @@
+pub mod clipdedup;
 pub mod combo;
 pub mod config;
 pub mod event;

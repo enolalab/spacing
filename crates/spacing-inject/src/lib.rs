@@ -1,3 +1,4 @@
+pub mod clipboard;
 pub mod map;
 
 use evdev::uinput::VirtualDeviceBuilder;
@@ -10,12 +11,13 @@ use std::io;
 
 /// Pluggable injection backend (spec §Traits): uinput today, the
 /// RemoteDesktop portal (libei) on capable Wayland desktops.
+/// Clipboard is intentionally NOT here — the loops own a `Clipboard`
+/// directly (server has no injector).
 #[async_trait::async_trait]
 pub trait InjectionBackend: Send {
     async fn inject(&mut self, ev: &InputEvent) -> io::Result<()>;
     /// Key-up everything currently held — disconnect/watchdog path.
     async fn release_all(&mut self) -> io::Result<()>;
-    async fn set_clipboard(&mut self, text: &str) -> io::Result<()>;
 }
 
 /// Pick an injection backend. `Auto`: portal when implemented and the
@@ -106,13 +108,6 @@ impl UinputInject {
         Ok(())
     }
 
-    /// P1 stub: clipboard lands in P2.
-    pub async fn set_clipboard(&mut self, _text: &str) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "clipboard not in P1",
-        ))
-    }
 }
 
 #[async_trait::async_trait]
@@ -123,10 +118,6 @@ impl InjectionBackend for UinputInject {
 
     async fn release_all(&mut self) -> io::Result<()> {
         UinputInject::release_all(self)
-    }
-
-    async fn set_clipboard(&mut self, text: &str) -> io::Result<()> {
-        UinputInject::set_clipboard(self, text).await
     }
 }
 
