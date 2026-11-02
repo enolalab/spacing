@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "."]
+default-members = ["."]
+exclude = []
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[package]
+name = "spacing"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+spacing-core = { path = "crates/spacing-core" }
+spacing-net = { path = "crates/spacing-net" }
+spacing-capture = { path = "crates/spacing-capture" }
+spacing-inject = { path = "crates/spacing-inject" }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+gethostname = "0.5"
