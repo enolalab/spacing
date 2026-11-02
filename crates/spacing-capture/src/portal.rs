@@ -51,11 +51,12 @@ pub fn edge_barriers(
     let mut out = Vec::with_capacity(edges.len());
     for edge in edges.keys() {
         let pos = match edge.as_str() {
-            // Barrier line sits on the last pixel INSIDE the zone.
-            "left" => BarrierPosition::new(min_x, min_y, min_x, max_y - 1),
-            "right" => BarrierPosition::new(max_x - 1, min_y, max_x - 1, max_y - 1),
-            "top" => BarrierPosition::new(min_x, min_y, max_x - 1, min_y),
-            "bottom" => BarrierPosition::new(min_x, max_y - 1, max_x - 1, max_y - 1),
+            // Barrier line must sit strictly OUTSIDE the zone rect —
+            // mutter rejects barriers that overlap the monitor region.
+            "left" => BarrierPosition::new(min_x - 1, min_y, min_x - 1, max_y - 1),
+            "right" => BarrierPosition::new(max_x, min_y, max_x, max_y - 1),
+            "top" => BarrierPosition::new(min_x, min_y - 1, max_x - 1, min_y - 1),
+            "bottom" => BarrierPosition::new(min_x, max_y, max_x - 1, max_y),
             other => {
                 tracing::warn!(edge = %other, "unknown edge name — skipped");
                 continue;
@@ -72,7 +73,9 @@ impl PortalCapture {
     /// ei socket handshake. Events stream into an mpsc channel read by
     /// `next_event`.
     pub async fn connect(edges: &EdgeMap) -> io::Result<Self> {
+        tracing::debug!("portal: InputCapture proxy");
         let ic = InputCapture::new().await.map_err(portal_err)?;
+        tracing::debug!("portal: create_session");
         let session = ic
             .create_session(
                 None,
@@ -83,6 +86,7 @@ impl PortalCapture {
             .map_err(portal_err)?
             .0;
 
+        tracing::debug!("portal: zones");
         let zones = ic
             .zones(&session, Default::default())
             .await
@@ -98,6 +102,7 @@ impl PortalCapture {
         let (barrier_objs, edge_names): (Vec<Barrier>, Vec<String>) =
             barriers.into_iter().unzip();
         if !barrier_objs.is_empty() {
+            tracing::debug!(n = barrier_objs.len(), "portal: set_pointer_barriers");
             let resp = ic
                 .set_pointer_barriers(
                     &session,
@@ -114,12 +119,16 @@ impl PortalCapture {
                 tracing::warn!(?failed, "some pointer barriers were rejected");
             }
         }
-        ic.enable(&session, EnableOptions::default())
+        // GNOME requires the EIS connection before enable —
+        // "Not connected to EIS" otherwise.
+        tracing::debug!("portal: connect_to_eis");
+        let fd = ic
+            .connect_to_eis(&session, ConnectToEISOptions::default())
             .await
             .map_err(portal_err)?;
 
-        let fd = ic
-            .connect_to_eis(&session, ConnectToEISOptions::default())
+        tracing::debug!("portal: enable");
+        ic.enable(&session, EnableOptions::default())
             .await
             .map_err(portal_err)?;
         let ctx = reis::ei::Context::new(UnixStream::from(fd))
@@ -285,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn right_edge_barrier_sits_on_last_inner_pixel() {
+    fn right_edge_barrier_sits_outside_zone() {
         let edges: EdgeMap = [("right".to_string(), "laptop".to_string())].into_iter().collect();
         let out = edge_barriers(&regions(), &edges);
         assert_eq!(out.len(), 1);

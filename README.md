@@ -18,17 +18,24 @@ Ctrl+Alt+0 → your input comes back local
 | Platform | Capture | Inject | Status |
 |---|---|---|---|
 | Linux (X11 / Wayland / TTY) | evdev | uinput | **supported** |
-| Linux Wayland (portal-native) | InputCapture portal | libei | planned |
+| Linux Wayland (portal-native) | InputCapture portal → libei | RemoteDesktop portal → libei | **supported** (GNOME 45+/KDE 6.1+) |
 | Windows | low-level hooks | SendInput | planned |
 | macOS | CGEventTap | CGEvent | planned |
 
-Current release is **Linux↔Linux**, switched by hotkey. The evdev/uinput
-backend works identically on X11, Wayland, and headless/TTY because it sits
-below the display server.
+Two backends on Linux, chosen by `backend = "auto"`:
+
+- **`evdev`** — kernel-level, works on X11, Wayland, and headless/TTY;
+  needs `/dev/input` + `/dev/uinput` access. Switch by hotkey.
+- **`portal`** — XDG InputCapture + RemoteDesktop portals over libei;
+  no udev rules needed, native Wayland. Switch by moving the pointer
+  across a configured screen edge (or `Ctrl+Alt+0` back).
 
 ## Features
 
+- **Screen-edge switching** (portal backend) — push the pointer through a
+  configured monitor edge to hand control to the mapped machine
 - **Hotkey switching** between the input-owner machine and any paired client
+- **Text clipboard sync** — copies follow your input, up to 1 MiB, both ways
 - **Mutual TLS 1.3** — every keystroke encrypted on the wire
 - **TOFU pairing** — SHA-256 fingerprint verify once, pinned to `peers.toml`
 - **Fail-safe by design** — client loss ungrabs instantly; a 500 ms watchdog
@@ -69,8 +76,12 @@ Portable static build (any Linux): `./contrib/build-static.sh` →
 
 ### Permissions (required, both machines)
 
-spacing reads real input devices (`/dev/input/event*`) and creates a virtual
-device (`/dev/uinput`):
+**Portal backend (Wayland, GNOME 45+/KDE 6.1+):** nothing — the portal
+mediates device access. The controlled machine approves a RemoteDesktop
+dialog the first time it runs `spacing client`.
+
+**evdev backend (default on X11/headless):** spacing reads real input
+devices (`/dev/input/event*`) and creates a virtual device (`/dev/uinput`):
 
 ```sh
 sudo cp contrib/99-spacing.rules /etc/udev/rules.d/
@@ -114,22 +125,33 @@ spacing client --to <server-ip>:24800
 # ~/.config/spacing/config.toml on the INPUT-OWNER machine
 mode = "server"
 bind = "0.0.0.0:24800"
+backend = "auto"                # auto|evdev|portal — portal on capable Wayland
 
 [server.hotkeys]
 local = "Ctrl+Alt+0"            # return input to this machine
 "Ctrl+Alt+1" = "laptop"         # → forward to client whose hostname is "laptop"
 "Ctrl+Alt+2" = "desktop"        # → another client
+
+# Portal backend only: pointer pushed through this edge switches control
+[server.layout.edges]
+right = "laptop"
+left  = "desktop"
 ```
 
-The hotkey target is the client's **hostname** — the value `hostname` prints
-on the controlled machine (sent in its `Hello`).
+The hotkey/edge target is the client's **hostname** — the value `hostname`
+prints on the controlled machine (sent in its `Hello`). Valid edge names:
+`left`, `right`, `top`, `bottom`.
 
 Client-side config is optional (`--to` is enough):
 
 ```toml
 mode = "client"
 connect_to = "192.168.1.5:24800"
+backend = "auto"                # same selection as the server
 ```
+
+On the portal backend the client machine shows a **RemoteDesktop dialog**
+the first time it connects — approve it to allow input injection.
 
 ## Security model
 
@@ -159,30 +181,34 @@ Measured on two Ubuntu 24.04 VMs (full methodology and raw data in the
 
 - **Hotplug:** devices plugged in *after* `serve` starts are not captured
   (enumeration happens once at startup). Restart `serve` after plugging in
-  new hardware.
+  new hardware. (evdev backend only)
+- **Portal backend:** barriers span the whole screen edge — per-monitor
+  sub-segments and zone-change hot-reload are not implemented yet.
+  RemoteDesktop prompts once per session start (restore tokens not wired).
+  Switching *away* from a remote uses `Ctrl+Alt+0`, not a reverse edge.
 - **Switch while holding modifiers:** pressing the switch combo while
   Ctrl/Alt is logically held can leave that modifier "stuck" on the server —
   press+release it once to clear.
 - IPv4/hostnames only in `host:port` (no `[v6]:port` parsing yet).
 - Media/consumer keys (volume etc.) are dropped at capture.
-- No clipboard yet (protocol field exists, backend lands in P2).
+- Clipboard is text-only, 1 MiB cap, polled (300 ms).
 - Remote→remote switching is implemented but lightly tested (needs 3 machines).
 
 ## Roadmap
 
-- **P2** — Wayland-native path: XDG InputCapture portal + libei inject,
-  edge/barrier switching, text clipboard (≤1 MiB)
+- ~~**P2** — Wayland-native path: XDG InputCapture portal + libei inject,
+  edge/barrier switching, text clipboard (≤1 MiB)~~ **done**
 - **P3** — Windows backend (hooks + SendInput)
 - **P4** — macOS backend (CGEventTap)
 - **P5** — edge-switch for evdev path, auto-reconnect, mDNS discovery,
-  systemd units, hotplug support
+  systemd units, hotplug support, RemoteDesktop restore tokens
 
 Design spec and P1 plan: [`docs/superpowers/specs/`](docs/superpowers/specs/).
 
 ## Development
 
 ```sh
-cargo test --workspace        # 24 tests incl. TLS loopback + stress
+cargo test --workspace        # 47 tests incl. TLS loopback + libei wire tests
 cargo clippy --workspace
 ```
 
