@@ -1772,8 +1772,6 @@ tracing = "0.1"
 use spacing_core::event::{InputEvent as Ev, MouseButton};
 use spacing_core::hidmap::hid_to_evdev;
 
-const SYN: (u16, u16, i32) = (0, 0, 0); // EV_SYN / SYN_REPORT
-
 /// BTN_* evdev code for a wire button (pub(crate) — injector tracks held
 /// buttons via these codes for release_all).
 pub(crate) fn btn_code(b: MouseButton) -> u16 {
@@ -1787,7 +1785,8 @@ pub(crate) fn btn_code(b: MouseButton) -> u16 {
 }
 
 fn ev(type_: evdev::EventType, code: u16, value: i32) -> evdev::InputEvent {
-    evdev::InputEvent::new(type_.0, code, value)
+    // evdev 0.12.2: InputEvent::new nhận EventType enum, không phải u16.
+    evdev::InputEvent::new(type_, code, value)
 }
 
 /// Expand one wire event into the evdev event sequence to emit
@@ -1829,7 +1828,7 @@ pub fn to_evdev(wire: &Ev) -> Vec<evdev::InputEvent> {
         }
     }
     if !out.is_empty() {
-        out.push(evdev::InputEvent::new(SYN.0, SYN.1, SYN.2));
+        out.push(ev(evdev::EventType::SYNCHRONIZATION, 0, 0)); // SYN_REPORT
     }
     out
 }
@@ -1913,8 +1912,8 @@ impl UinputInject {
         let held: Vec<u16> = self.held.drain().collect();
         for code in held {
             self.dev.emit(&[
-                evdev::InputEvent::new(evdev::EventType::KEY.0, code, 0),
-                evdev::InputEvent::new(0, 0, 0),
+                evdev::InputEvent::new(evdev::EventType::KEY, code, 0),
+                evdev::InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
             ])?;
         }
         Ok(())

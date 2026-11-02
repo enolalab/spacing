@@ -1251,6 +1251,11 @@ dependencies = [
 [[package]]
 name = "spacing-inject"
 version = "0.1.0"
+dependencies = [
+ "evdev",
+ "spacing-core",
+ "tracing",
+]
 
 [[package]]
 name = "spacing-net"
