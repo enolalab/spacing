@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            kind: tar
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            kind: zip
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            kind: tar
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            kind: tar
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --bin spacing --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.kind == 'tar'
+        shell: bash
+        run: |
+          pkg="spacing-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          mkdir -p "stage/$pkg" dist
+          cp "target/${{ matrix.target }}/release/spacing" "stage/$pkg/"
+          cp LICENSE README.md "stage/$pkg/"
+          tar -czf "dist/$pkg.tar.gz" -C stage "$pkg"
+
+      - name: Package (zip)
+        if: matrix.kind == 'zip'
+        shell: bash
+        run: |
+          pkg="spacing-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          mkdir -p "stage/$pkg" dist
+          cp "target/${{ matrix.target }}/release/spacing.exe" "stage/$pkg/"
+          cp LICENSE README.md "stage/$pkg/"
+          (cd stage && 7z a "../dist/$pkg.zip" "$pkg")
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
