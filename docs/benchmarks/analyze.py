@@ -2,9 +2,11 @@
 """Pair emit-bench 'E <ts> <seq>' lines with listen 'R <ts> <type> <code>
 <val>' lines and print latency stats (ms). LAN runs need a skew
 correction: pass S1,T1,S2,T2 (two NTP-style skew samples bracketing the
-emit window) to interpolate per-event clock offset.
+emit window) to interpolate per-event clock offset. On Windows the 'R'
+line's code field is a VK number (use --vk to keep one key); on Linux it
+is an evdev code.
 
-Usage: analyze.py <emit.log> <recv.log> key|mouse [S1 T1 S2 T2]
+Usage: analyze.py <emit.log> <recv.log> key|mouse [S1 T1 S2 T2] [--vk N]
 """
 import statistics as st
 import sys
@@ -23,11 +25,13 @@ def load_e(path):
     return e
 
 
-def load_r(path):
+def load_r(path, vk=None):
     r = []
     for line in open(path):
         p = line.split()
         if len(p) == 5 and p[0] == "R":
+            if vk is not None and int(p[3]) != vk:
+                continue
             r.append((int(p[1]), int(p[4])))  # (ts, value)
     return r
 
@@ -35,11 +39,17 @@ def load_r(path):
 def main():
     emit_f, recv_f, kind = sys.argv[1], sys.argv[2], sys.argv[3]
     skew_fn = (lambda t: 0)
-    if len(sys.argv) == 8:
-        s1, t1, s2, t2 = map(int, sys.argv[4:8])
+    args = sys.argv[4:]
+    vk = None
+    if "--vk" in args:
+        i = args.index("--vk")
+        vk = int(args[i + 1])
+        del args[i : i + 2]
+    if len(args) == 4:
+        s1, t1, s2, t2 = map(int, args)
         skew_fn = lambda t: s1 + (s2 - s1) * (t - t1) / (t2 - t1)
 
-    E, R = load_e(emit_f), load_r(recv_f)
+    E, R = load_e(emit_f), load_r(recv_f, vk)
     seqs = sorted(E)
     lats = []
     if kind == "key":

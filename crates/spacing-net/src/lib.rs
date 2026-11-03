@@ -62,6 +62,9 @@ pub async fn accept_server(
     peers_path: std::path::PathBuf,
 ) -> anyhow::Result<ServerConn> {
     ensure_provider();
+    // Input frames are tiny and latency-critical — Nagle's algorithm would
+    // hold them for a delayed ACK (~40ms on Windows).
+    tcp.set_nodelay(true)?;
     let verifier = Arc::new(verify::PairingVerifier {
         peers: peers.clone(),
         pairing_open: pairing_open.clone(),
@@ -135,6 +138,7 @@ pub async fn connect_client(
     verify: impl Fn(&str) -> bool,
 ) -> anyhow::Result<ClientConn> {
     ensure_provider();
+    tcp.set_nodelay(true)?;
     let cfg = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verify::AcceptAnyServerCert))
